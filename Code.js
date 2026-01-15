@@ -10,13 +10,21 @@
 function onOpen() {
   const ui = SpreadsheetApp.getUi();
   ui.createMenu("CM360 QA Tools")
-    .addItem("Run It All", "runItAll")
-    .addItem("Pull Data", "importDCMReports")
-    .addItem("Run QA Only", "runQAOnly")
-    .addItem("Send Email Only", "sendEmailSummary")
+    .addItem("▶️ Run It All (Immediate)", "runItAll")
+    .addItem("🔄 Run It All (Auto-Resume)", "runItAllChunked")
     .addSeparator()
-    .addItem("Authorize Email (one-time)", "authorizeMail_")         // <-- add this
-    .addItem("Create Daily Email Trigger (9am)", "createDailyEmailTrigger") // <-- and this
+    .addItem("Pull Data (Immediate)", "importDCMReports")
+    .addItem("Pull Data (Auto-Resume)", "importDCMReportsChunked")
+    .addItem("Run QA Only (Immediate)", "runQAOnlyImmediate")
+    .addItem("Run QA Only (Auto-Resume)", "runQAOnly")
+    .addItem("Send Email Only (Immediate)", "sendEmailSummaryImmediate")
+    .addItem("Send Email Only (Auto-Resume)", "sendEmailSummary")
+    .addSeparator()
+    .addItem("📊 System Status", "showSystemStatus")
+    .addItem("🔄 Reset All State (if stuck)", "resetAllState")
+    .addSeparator()
+    .addItem("Authorize Email (one-time)", "authorizeMail_")
+    .addItem("Create Daily Email Trigger (9am)", "createDailyEmailTrigger")
     .addSeparator()
     .addItem("Clear Violations", "clearViolations")
     .addToUi();
@@ -138,6 +146,15 @@ const QA_CHUNK_ROWS = 3500;
 const QA_TIME_BUDGET_MS = 4.2 * 60 * 1000;
 const QA_STATE_KEY = 'qa_progress_v2';      // DocumentProperties key
 
+// ====== Chunked EMAIL execution control ======
+const EMAIL_TIME_BUDGET_MS = 4.5 * 60 * 1000;
+const EMAIL_STATE_KEY = 'email_progress_v1';
+const EMAIL_TRIGGER_KEY = 'email_chunk_trigger_id';
+const MAX_OWNERS_PER_CHUNK = 5;
+
+// ====== Error notification ======
+const ADMIN_EMAIL = 'bkaufman@horizonmedia.com';
+
 // --- Auto-resume trigger control for QA chunks ---
 const QA_TRIGGER_KEY = 'qa_chunk_trigger_id';   // ScriptProperties key for one-shot trigger
 const QA_LOCK_KEY = 'qa_chunk_lock';            // logical name only
@@ -184,6 +201,161 @@ function saveQAState_(obj) {
 }
 function clearQAState_() {
   PropertiesService.getDocumentProperties().deleteProperty(QA_STATE_KEY);
+}
+
+// ====== Email State Management (parallel to QA state) ======
+function getEmailState_() {
+  const raw = PropertiesService.getDocumentProperties().getProperty(EMAIL_STATE_KEY);
+  return raw ? JSON.parse(raw) : null;
+}
+
+function saveEmailState_(obj) {
+  PropertiesService.getDocumentProperties().setProperty(EMAIL_STATE_KEY, JSON.stringify(obj));
+}
+
+function clearEmailState_() {
+  PropertiesService.getDocumentProperties().deleteProperty(EMAIL_STATE_KEY);
+}
+
+function scheduleNextEmailChunk_(minutesFromNow) {
+  minutesFromNow = Math.max(1, Math.min(10, Math.floor(minutesFromNow || 2)));
+  const props = getScriptProps_();
+  
+  const existingId = props.getProperty(EMAIL_TRIGGER_KEY);
+  if (existingId) {
+    const stillThere = ScriptApp.getProjectTriggers().some(function(t){ return t.getUniqueId() === existingId; });
+    if (stillThere) return;
+    props.deleteProperty(EMAIL_TRIGGER_KEY);
+  }
+  
+  const trig = ScriptApp
+    .newTrigger('sendEmailSummary')
+    .timeBased()
+    .after(minutesFromNow * 60 * 1000)
+    .create();
+  
+  props.setProperty(EMAIL_TRIGGER_KEY, trig.getUniqueId());
+}
+
+function cancelEmailChunkTrigger_() {
+  const props = getScriptProps_();
+  const id = props.getProperty(EMAIL_TRIGGER_KEY);
+  if (!id) return;
+  ScriptApp.getProjectTriggers().forEach(function(t){
+    if (t.getUniqueId() === id) ScriptApp.deleteTrigger(t);
+  });
+  props.deleteProperty(EMAIL_TRIGGER_KEY);
+}
+
+// ====== Error Notification System ======
+function sendFailureEmail_(functionName, error, additionalContext) {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const today = new Date();
+    const dateStr = Utilities.formatDate(today, Session.getScriptTimeZone(), "MMM dd, yyyy h:mm a");
+    
+    const errorMsg = error ? (error.message || String(error)) : 'Unknown error';
+    const errorStack = error && error.stack ? error.stack : '';
+    
+    let context = additionalContext || {};
+    
+    const subject = '⚠️ CM360 QA FAILURE - ' + functionName + ' - ' + dateStr;
+    
+    let body = '<html><body style="font-family: Arial, sans-serif;">';
+    body += '<h2 style="color: #d9534f;">⚠️ CM360 QA Automation Failure</h2>';
+    body += '<table border="1" cellpadding="8" cellspacing="0" style="border-collapse: collapse; margin: 20px 0;">';
+    body += '<tr><td style="font-weight:bold; background: #f5f5f5;">Function</td><td>' + functionName + '</td></tr>';
+    body += '<tr><td style="font-weight:bold; background: #f5f5f5;">Timestamp</td><td>' + dateStr + '</td></tr>';
+    body += '<tr><td style="font-weight:bold; background: #f5f5f5;">Error</td><td style="color: #d9534f;">' + errorMsg + '</td></tr>';
+    
+    if (context.stage) {
+      body += '<tr><td style="font-weight:bold; background: #f5f5f5;">Stage</td><td>' + context.stage + '</td></tr>';
+    }
+    if (context.duration) {
+      body += '<tr><td style="font-weight:bold; background: #f5f5f5;">Duration</td><td>' + context.duration + '</td></tr>';
+    }
+    if (context.rawDataRows) {
+      body += '<tr><td style="font-weight:bold; background: #f5f5f5;">Raw Data Rows</td><td>' + context.rawDataRows + '</td></tr>';
+    }
+    if (context.violations) {
+      body += '<tr><td style="font-weight:bold; background: #f5f5f5;">Violations</td><td>' + context.violations + '</td></tr>';
+    }
+    
+    body += '</table>';
+    
+    if (errorStack) {
+      body += '<h3>Stack Trace:</h3>';
+      body += '<pre style="background: #f5f5f5; padding: 10px; overflow: auto;">' + errorStack + '</pre>';
+    }
+    
+    body += '<p><b>Action Required:</b> Check the Apps Script execution logs or run the function manually from the menu to see detailed output.</p>';
+    body += '<p><a href="https://script.google.com/home/projects/' + ScriptApp.getScriptId() + '/executions">View Execution Logs</a></p>';
+    body += '<p><a href="' + ss.getUrl() + '">Open Spreadsheet</a></p>';
+    body += '<hr/>';
+    body += '<p style="color: #666; font-size: 11px;"><i>Automated failure notification from CM360 QA Tools</i></p>';
+    body += '</body></html>';
+    
+    MailApp.sendEmail({
+      to: ADMIN_EMAIL,
+      subject: subject,
+      htmlBody: body
+    });
+    
+    logAuditEntry_(functionName, 'FAILED', null, context.rawDataRows, context.violations, errorMsg);
+  } catch (e) {
+    Logger.log('❌ Failed to send failure notification: ' + e);
+  }
+}
+
+function isManualRun_() {
+  // Check if we're running from a time-based trigger
+  const triggers = ScriptApp.getProjectTriggers();
+  const currentFunction = new Error().stack.split('\n')[2].match(/at (\w+)/);
+  if (!currentFunction) return true;
+  
+  const funcName = currentFunction[1];
+  const hasMatchingTrigger = triggers.some(function(t){
+    return t.getHandlerFunction() === funcName && 
+           t.getEventType() === ScriptApp.EventType.CLOCK;
+  });
+  
+  return !hasMatchingTrigger;
+}
+
+// ====== Audit Logging ======
+function getAuditSheet_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const lock = LockService.getDocumentLock();
+  lock.waitLock(30000);
+  try {
+    let sh = ss.getSheetByName("_Execution Log");
+    if (!sh) {
+      sh = ss.insertSheet("_Execution Log");
+      sh.hideSheet();
+      sh.getRange(1, 1, 1, 7).setValues([["Timestamp", "Function", "Status", "Duration", "Raw Rows", "Violations", "Error"]]);
+    }
+    return sh;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function logAuditEntry_(functionName, status, durationMs, rawRows, violations, error) {
+  try {
+    const sh = getAuditSheet_();
+    const now = new Date();
+    const duration = durationMs ? fmtMs_(durationMs) : '';
+    const errorMsg = error ? String(error).substring(0, 500) : '';
+    
+    sh.appendRow([now, functionName, status, duration, rawRows || '', violations || '', errorMsg]);
+    
+    // Keep only last 1000 entries
+    if (sh.getLastRow() > 1001) {
+      sh.deleteRows(2, sh.getLastRow() - 1001);
+    }
+  } catch (e) {
+    Logger.log('Failed to log audit entry: ' + e);
+  }
 }
 
 // ---------------------
@@ -1138,53 +1310,291 @@ function _parsePct_(s) { // "95.00%" -> 95
 
 
 // ---------------------
-// sendEmailSummary (size-safe) — UPDATED with extra buckets
+// sendEmailSummary (size-safe, chunked execution) — UPDATED with extra buckets
 // ---------------------
 function sendEmailSummary() {
-  // Skip if QA is still running in chunks
-  const _qaState = getQAState_();
-  if (_qaState && _qaState.session) {
-    Logger.log("sendEmailSummary skipped: QA still in progress (chunked).");
+  sendEmailSummaryChunked_(true); // true = allow chunking
+}
+
+function sendEmailSummaryChunked_(allowChunking) {
+  const startTime = Date.now();
+  const isAuto = !isManualRun_();
+  
+  // Prevent overlapping runs
+  const dlock = LockService.getDocumentLock();
+  if (!dlock.tryLock(5000)) {
+    if (allowChunking) scheduleNextEmailChunk_(2);
     return;
   }
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const today = new Date();
+  
+  try {
+    // Skip if QA is still running in chunks
+    const _qaState = getQAState_();
+    if (_qaState && _qaState.session) {
+      Logger.log("sendEmailSummary skipped: QA still in progress (chunked).");
+      if (allowChunking) scheduleNextEmailChunk_(5); // Check again in 5 min
+      return;
+    }
+    
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const today = new Date();
 
-  // Only send on/after the 15th
-  if (today.getDate() < 15) {
-    Logger.log("Email summary skipped: before the 15th of the month.");
-    return;
+    // Only send on/after the 15th
+    if (today.getDate() < 15) {
+      Logger.log("Email summary skipped: before the 15th of the month.");
+      clearEmailState_();
+      cancelEmailChunkTrigger_();
+      return;
+    }
+
+    // Get or create state
+    let state = getEmailState_();
+    const freshStart = !state || !state.session;
+    
+    if (freshStart) {
+      state = {
+        session: String(Date.now()),
+        stage: 'network_summary',
+        cachedHtml: {},
+        processedOwners: [],
+        allOwners: []
+      };
+      saveEmailState_(state);
+      cancelEmailChunkTrigger_();
+    }
+
+    const sheet = ss.getSheetByName("Violations");
+    const rawSheet = ss.getSheetByName("Raw Data");
+    const networksSheet = ss.getSheetByName("Networks");
+    const recipientsSheet = ss.getSheetByName("EMAIL LIST");
+    
+    if (!sheet || !rawSheet || !recipientsSheet) {
+      const error = new Error('Required sheets missing');
+      if (isAuto) sendFailureEmail_('sendEmailSummary', error, { stage: state.stage });
+      throw error;
+    }
+
+    const violations = sheet.getDataRange().getValues();
+    const rawData = rawSheet.getDataRange().getValues();
+    
+    if (violations.length <= 1) {
+      Logger.log("No violations to report");
+      clearEmailState_();
+      cancelEmailChunkTrigger_();
+      return;
+    }
+
+    // === STAGE 1: Network Summary ===
+    if (state.stage === 'network_summary') {
+      Logger.log('📧 Email Stage 1/4: Building network summary...');
+      
+      state.cachedHtml.networkSummary = buildNetworkSummaryHtml_(violations, rawData, networksSheet);
+      state.stage = 'grouped_summary';
+      saveEmailState_(state);
+      
+      if (allowChunking && (Date.now() - startTime) > EMAIL_TIME_BUDGET_MS) {
+        Logger.log('⏳ Email stage 1 complete, scheduling next chunk');
+        scheduleNextEmailChunk_(2);
+        return;
+      }
+    }
+
+    // === STAGE 2: Grouped Summary ===
+    if (state.stage === 'grouped_summary') {
+      Logger.log('📧 Email Stage 2/4: Building grouped summary...');
+      
+      state.cachedHtml.groupedSummary = buildGroupedSummaryHtml_(violations);
+      state.cachedHtml.staleHtml = buildStaleHtml_(violations);
+      state.stage = 'immediate_attention';
+      saveEmailState_(state);
+      
+      if (allowChunking && (Date.now() - startTime) > EMAIL_TIME_BUDGET_MS) {
+        Logger.log('⏳ Email stage 2 complete, scheduling next chunk');
+        scheduleNextEmailChunk_(2);
+        return;
+      }
+    }
+
+    // === STAGE 3: Immediate Attention (chunked by owner) ===
+    if (state.stage === 'immediate_attention') {
+      if (!state.cachedHtml.immediateAttention) state.cachedHtml.immediateAttention = '';
+      
+      // Build owner list if first time
+      if (state.allOwners.length === 0) {
+        const ownerData = buildImmediateAttentionData_(violations);
+        state.allOwners = ownerData.owners;
+        state.ownerMap = ownerData.perOwner;
+        state.processedOwners = [];
+      }
+      
+      // Process owners in chunks
+      const remainingOwners = state.allOwners.filter(function(o){ return state.processedOwners.indexOf(o) === -1; });
+      
+      if (remainingOwners.length > 0) {
+        const chunkSize = allowChunking ? MAX_OWNERS_PER_CHUNK : remainingOwners.length;
+        const ownersThisChunk = remainingOwners.slice(0, chunkSize);
+        
+        Logger.log('📧 Email Stage 3/4: Processing ' + ownersThisChunk.length + ' owners (' + remainingOwners.length + ' remaining)...');
+        
+        const htmlChunk = buildImmediateAttentionHtmlForOwners_(ownersThisChunk, state.ownerMap);
+        state.cachedHtml.immediateAttention += htmlChunk;
+        state.processedOwners = state.processedOwners.concat(ownersThisChunk);
+        saveEmailState_(state);
+        
+        if (allowChunking && remainingOwners.length > chunkSize && (Date.now() - startTime) > EMAIL_TIME_BUDGET_MS) {
+          Logger.log('⏳ Email stage 3 partial, scheduling next chunk');
+          scheduleNextEmailChunk_(2);
+          return;
+        }
+      }
+      
+      // Wrap up immediate attention section
+      if (state.cachedHtml.immediateAttention) {
+        state.cachedHtml.immediateAttention = '<p><b>Immediate Attention — Key Issues (by Owner)</b></p>' + state.cachedHtml.immediateAttention;
+      }
+      
+      state.stage = 'create_xlsx';
+      saveEmailState_(state);
+      
+      if (allowChunking && (Date.now() - startTime) > EMAIL_TIME_BUDGET_MS) {
+        Logger.log('⏳ Email stage 3 complete, scheduling next chunk');
+        scheduleNextEmailChunk_(2);
+        return;
+      }
+    }
+
+    // === STAGE 4: Create XLSX ===
+    if (state.stage === 'create_xlsx') {
+      Logger.log('📧 Email Stage 4/4: Creating XLSX attachment...');
+      
+      const todayformatted = Utilities.formatDate(today, Session.getScriptTimeZone(), "M.d.yy");
+      const fileName = "CM360_QA_Violations_" + todayformatted + ".xlsx";
+      
+      try {
+        const xlsxBlob = createXLSXFromSheet(sheet).setName(fileName);
+        
+        // Store in Drive temporarily
+        const tempFile = DriveApp.createFile(xlsxBlob);
+        state.xlsxFileId = tempFile.getId();
+        state.xlsxFileName = fileName;
+      } catch (e) {
+        Logger.log('❌ XLSX creation failed: ' + e.message);
+        if (isAuto) sendFailureEmail_('sendEmailSummary', e, { stage: 'create_xlsx', rawDataRows: rawData.length - 1, violations: violations.length - 1 });
+        throw e;
+      }
+      
+      state.stage = 'send';
+      saveEmailState_(state);
+      
+      if (allowChunking && (Date.now() - startTime) > EMAIL_TIME_BUDGET_MS) {
+        Logger.log('⏳ Email stage 4 complete, scheduling next chunk');
+        scheduleNextEmailChunk_(2);
+        return;
+      }
+    }
+
+    // === STAGE 5: Send Email ===
+    if (state.stage === 'send') {
+      Logger.log('📧 Email Stage 5/5: Assembling and sending email...');
+      
+      // Get recipients
+      const emails = recipientsSheet.getRange("A2:A").getValues()
+        .flat()
+        .map(function(e){ return String(e || "").trim(); })
+        .filter(Boolean);
+      const uniqueEmails = Array.from(new Set(emails));
+      
+      if (uniqueEmails.length === 0) {
+        Logger.log('⚠️ No recipients found');
+        clearEmailState_();
+        cancelEmailChunkTrigger_();
+        return;
+      }
+
+      // Generate mid-flight drop HTML
+      const midFlightHtml = generateMidFlightDropHtml_();
+
+      // Assemble email
+      const subject = "CM360 CPC/CPM FLIGHT QA – " + Utilities.formatDate(today, Session.getScriptTimeZone(), "M/d/yy");
+      let htmlBody = state.cachedHtml.networkSummary +
+                     '<p>The below is a table of the following Billing, Delivery, Performance and Cost issues:</p>' +
+                     state.cachedHtml.groupedSummary +
+                     (state.cachedHtml.immediateAttention ? ('<br/>' + state.cachedHtml.immediateAttention) : '') +
+                     (midFlightHtml ? ('<br/>' + midFlightHtml) : '') +
+                     '<br/>' + state.cachedHtml.staleHtml +
+                     '<p><i>Brought to you by the Platform Solutions Automation. (Made by: BK)</i></p>';
+
+      // Safety trim
+      const MAX_HTML_CHARS = 90000;
+      if (htmlBody.length > MAX_HTML_CHARS) {
+        htmlBody = htmlBody.slice(0, MAX_HTML_CHARS - 1200) +
+                  '<p><i>(trimmed for size — full detail in the attached XLSX)</i></p>';
+      }
+
+      // Get XLSX from Drive
+      const xlsxFile = DriveApp.getFileById(state.xlsxFileId);
+      const xlsxBlob = xlsxFile.getBlob().setName(state.xlsxFileName);
+
+      // Send emails
+      let failedRecipients = [];
+      uniqueEmails.forEach(function(addr){
+        try {
+          MailApp.sendEmail({ to: addr, subject: subject, htmlBody: htmlBody, attachments: [xlsxBlob] });
+          Utilities.sleep(300);
+        } catch (err) {
+          Logger.log("❌ Failed to email " + addr + ": " + err);
+          failedRecipients.push(addr);
+        }
+      });
+
+      // Cleanup
+      try {
+        xlsxFile.setTrashed(true);
+      } catch (e) {
+        Logger.log('⚠️ Could not delete temp XLSX: ' + e.message);
+      }
+
+      clearEmailState_();
+      cancelEmailChunkTrigger_();
+
+      const duration = Date.now() - startTime;
+      Logger.log('✅ Email sent to ' + (uniqueEmails.length - failedRecipients.length) + '/' + uniqueEmails.length + ' recipients in ' + fmtMs_(duration));
+      
+      logAuditEntry_('sendEmailSummary', 'SUCCESS', duration, rawData.length - 1, violations.length - 1, null);
+
+      if (failedRecipients.length > 0 && isAuto) {
+        sendFailureEmail_('sendEmailSummary', new Error('Failed to send to: ' + failedRecipients.join(', ')), {
+          stage: 'send',
+          duration: fmtMs_(duration),
+          rawDataRows: rawData.length - 1,
+          violations: violations.length - 1
+        });
+      }
+    }
+
+  } catch (e) {
+    Logger.log('❌ sendEmailSummary error: ' + e.message);
+    if (isAuto) {
+      const rawCount = rawSheet ? rawSheet.getLastRow() - 1 : 0;
+      const violCount = sheet ? sheet.getLastRow() - 1 : 0;
+      sendFailureEmail_('sendEmailSummary', e, {
+        stage: state ? state.stage : 'unknown',
+        duration: fmtMs_(Date.now() - startTime),
+        rawDataRows: rawCount,
+        violations: violCount
+      });
+    }
+    throw e;
+  } finally {
+    dlock.releaseLock();
   }
+}
 
-  // --- Email size & filtering controls ---
-  const INCLUDE_APPENDIX = false;
-  const INCLUDE_ZERO_NETS = false;
-  const MAX_ROWS_PER_OWNER = 30;
-  const MAX_TOTAL_OWNER_ROWS = 1000;
-  const MAX_HTML_CHARS = 90000;
-
-  // Sheets
-  const sheet           = ss.getSheetByName("Violations");
-  const rawSheet        = ss.getSheetByName("Raw Data");
-  const networksSheet   = ss.getSheetByName("Networks");
-  const recipientsSheet = ss.getSheetByName("EMAIL LIST");
-  if (!sheet || !rawSheet || !recipientsSheet) return;
-
-  // Recipients
-  const emails = recipientsSheet.getRange("A2:A").getValues()
-    .flat().map(function(e){ return String(e || "").trim(); }).filter(Boolean);
-  const uniqueEmails = Array.from(new Set(emails));
-  if (uniqueEmails.length === 0) return;
-
-  // Data
-  const violations = sheet.getDataRange().getValues();
-  const rawData    = rawSheet.getDataRange().getValues();
-  if (violations.length <= 1) return;
-
+// Helper functions for chunked email generation
+function buildNetworkSummaryHtml_(violations, rawData, networksSheet) {
   const hMap = getHeaderMap(violations[0]);
   const rMap = getHeaderMap(rawData[0]);
 
-  // --- Network ID -> Network Name ---
   function buildNetworkNameMap_() {
     if (!networksSheet) return {};
     const vals = networksSheet.getDataRange().getValues();
@@ -1207,17 +1617,15 @@ function sendEmailSummary() {
   }
   const networkNameMap = buildNetworkNameMap_();
 
-  // --- Counts per network ---
   const placementCounts = {};
   rawData.slice(1).forEach(function(r){
     const id = String(r[rMap["Network ID"]] || "");
     if (id) placementCounts[id] = (placementCounts[id] || 0) + 1;
   });
 
-  // --- Violation counts per network (by group) ---
   const violationCounts = {};
   violations.slice(1).forEach(function(r){
-    const id    = String(r[hMap["Network ID"]] || "");
+    const id = String(r[hMap["Network ID"]] || "");
     const types = String(r[hMap["Issue Type"]] || "").split(", ");
     if (!violationCounts[id]) {
       violationCounts[id] = { "🟥 BILLING": 0, "🟦 DELIVERY": 0, "🟨 PERFORMANCE": 0, "🟩 COST": 0 };
@@ -1230,9 +1638,7 @@ function sendEmailSummary() {
     });
   });
 
-  // --- Network summary table ---
-  let networkSummary =
-      '<p><b>Network-Level QA Summary</b></p>'
+  let html = '<p><b>Network-Level QA Summary</b></p>'
     + '<table border="1" cellpadding="4" cellspacing="0" style="border-collapse: collapse; font-size: 11px;">'
     + '<tr style="background-color: #f2f2f2; font-weight: bold;">'
     + '<th>Network ID</th><th>Network Name</th><th>Placements Checked</th>'
@@ -1242,7 +1648,6 @@ function sendEmailSummary() {
   Object.entries(networkNameMap)
     .filter(function(pair){
       const id = pair[0];
-      if (INCLUDE_ZERO_NETS) return true;
       const vc = violationCounts[id] || { "🟥 BILLING":0,"🟦 DELIVERY":0,"🟨 PERFORMANCE":0,"🟩 COST":0 };
       const total = vc["🟥 BILLING"] + vc["🟦 DELIVERY"] + vc["🟨 PERFORMANCE"] + vc["🟩 COST"];
       return total > 0;
@@ -1252,15 +1657,20 @@ function sendEmailSummary() {
       const id = entry[0], name = entry[1];
       const pc = placementCounts[id] || 0;
       const vc = violationCounts[id] || { "🟥 BILLING":0,"🟦 DELIVERY":0,"🟨 PERFORMANCE":0,"🟩 COST":0 };
-      networkSummary += '<tr>'
+      html += '<tr>'
         + '<td>' + id + '</td><td>' + name + '</td><td>' + pc + '</td>'
         + '<td>' + vc["🟥 BILLING"] + '</td><td>' + vc["🟦 DELIVERY"] + '</td><td>' + vc["🟨 PERFORMANCE"] + '</td><td>' + vc["🟩 COST"] + '</td>'
         + '</tr>';
     });
-  networkSummary += '</table><br/>';
+  html += '</table><br/>';
+  
+  return html;
+}
 
-  // --- Grouped issue summary (unchanged) ---
+function buildGroupedSummaryHtml_(violations) {
+  const hMap = getHeaderMap(violations[0]);
   const groupedCounts = { "🟥 BILLING": {}, "🟦 DELIVERY": {}, "🟨 PERFORMANCE": {}, "🟩 COST": {} };
+  
   violations.slice(1).forEach(function(r){
     const types = String(r[hMap["Issue Type"]] || "").split(", ");
     types.forEach(function(t){
@@ -1273,55 +1683,65 @@ function sendEmailSummary() {
       }
     });
   });
-  let summaryHtml = "";
+  
+  let html = "";
   Object.entries(groupedCounts).forEach(function(entry){
     const groupLabel = entry[0], subtypes = entry[1];
-    summaryHtml += "<b>" + groupLabel + "</b><ul>";
+    html += "<b>" + groupLabel + "</b><ul>";
     Object.entries(subtypes).forEach(function(st){
       const subtype = st[0], count = st[1];
-      if (count > 0) summaryHtml += "<li>" + subtype + ": " + count + "</li>";
+      if (count > 0) html += "<li>" + subtype + ": " + count + "</li>";
     });
-    summaryHtml += "</ul>";
+    html += "</ul>";
   });
+  
+  return html;
+}
 
-  // --- Immediate Attention — Key Issues (by Owner) — UPDATED bucket logic
-  function buildImmediateAttentionByOwner_() {
-    const ownerMap = loadOwnerMapFromNetworks_();
+function buildStaleHtml_(violations) {
+  const thresholdDays = getStaleThresholdDays_();
+  let staleImp = 0, staleClk = 0;
+  const hMap = getHeaderMap(violations[0]);
+  const impIdx = hMap["Last Imp Change"], clkIdx = hMap["Last Click Change"];
+  
+  if (impIdx !== undefined || clkIdx !== undefined) {
+    for (let i = 1; i < violations.length; i++) {
+      const r = violations[i];
+      const impDays = impIdx !== undefined ? Number(r[impIdx]) : NaN;
+      const clkDays = clkIdx !== undefined ? Number(r[clkIdx]) : NaN;
+      if (isFinite(impDays) && impDays >= thresholdDays) staleImp++;
+      if (isFinite(clkDays) && clkDays >= thresholdDays) staleClk++;
+    }
+  }
+  
+  return "<b>Stale Metrics (this month)</b><ul>"
+    + "<li>Placements with no new impressions since last change (≥ " + thresholdDays + " days): " + staleImp + "</li>"
+    + "<li>Placements with no new clicks since last change (≥ " + thresholdDays + " days): " + staleClk + "</li>"
+    + "</ul>";
+}
+
+function buildImmediateAttentionData_(violations) {
+  const ownerMap = loadOwnerMapFromNetworks_();
+  const hMap = getHeaderMap(violations[0]);
   const perOwner = {};
+  
+  const MAX_ROWS_PER_OWNER = 30;
+  const MAX_TOTAL_OWNER_ROWS = 1000;
 
-  // Column indexes
   const idx = {
-    netId: hMap["Network ID"],
-    adv:   hMap["Advertiser"],
-    camp:  hMap["Campaign"],
-    pid:   hMap["Placement ID"],
-    plc:   hMap["Placement"],
-    impr:  hMap["Impressions"],
-    clk:   hMap["Clicks"],
-    ctr:   hMap["CTR (%)"],
-    cpc$:  hMap["$CPC"],
-    cpm$:  hMap["$CPM"],
-    issues:hMap["Issue Type"],
-    rd:    hMap["Report Date"],
-    pe:    hMap["Placement End Date"]
+    netId: hMap["Network ID"], adv: hMap["Advertiser"], camp: hMap["Campaign"],
+    pid: hMap["Placement ID"], plc: hMap["Placement"], impr: hMap["Impressions"],
+    clk: hMap["Clicks"], ctr: hMap["CTR (%)"], cpc$: hMap["$CPC"], cpm$: hMap["$CPM"],
+    issues: hMap["Issue Type"], rd: hMap["Report Date"], pe: hMap["Placement End Date"]
   };
 
-  // bucket order (lower = higher priority in sort)
-  const BUCKETS = {
-    PERF: 1,               // 🟨 Performance
-    COST_BIMBAL: 2,        // 🟩 CPC+CPM clicks>impr & $CPC>10
-    BILLING: 3,            // 🟥 (Active/Recently Expired/Expired) + tightened rules
-    DELIV_STRICT: 4,       // 🟦 Post-flight + clicks>impr + $CPC>10
-    DELIV_CPM_ONLY: 5,     // 🟦 Post-flight + CPM-only >$10
-    DELIV_GENERAL: 6       // 🟦 Post-flight (any activity) but only if $CPC>10 || $CPM>10
-  };
-
+  const BUCKETS = { PERF: 1, COST_BIMBAL: 2, BILLING: 3, DELIV_STRICT: 4, DELIV_CPM_ONLY: 5, DELIV_GENERAL: 6 };
+  
   const today = new Date();
   const firstOfMonth = new Date(today.getFullYear(), today.getMonth(), 1);
 
   function qualifies_(row) {
     const issues = String(row[idx.issues] || "");
-    // exclude Low Priority rows entirely
     if (/\(Low Priority\)/i.test(issues)) return null;
 
     const imp = Number(row[idx.impr] || 0);
@@ -1337,80 +1757,64 @@ function sendEmailSummary() {
     const pe = new Date(row[idx.pe]);
     const isPostFlight = pe < firstOfMonth && rd >= firstOfMonth;
 
-    // === Your inclusion rules ===
-
-    // 🟨 PERFORMANCE: CTR ≥ 90% & CPM ≥ $10
-    const isPerformance = /🟨\s*PERFORMANCE: CTR ≥ 90% & CPM ≥ \$?10/.test(issues) ||
-                          (ctrPct >= 90 && cpm >= 10);
-
-    // 🟩 CPC+CPM Clicks > Impr & CPC > $10  (both metrics, clicks>impr & CPC>10)
-    const isCostBothMetricsClicksGtImpr = /🟩\s*COST: CPC\+CPM Clicks > Impr.*CPC > \$?10/i.test(issues) ||
-                                          (both && clicksGtImpr && cpc > 10);
-
-    // 🟥 BILLING (tightened to both metrics, clicks>impr & $CPC>10)
-    const isBillingActive   = /🟥\s*BILLING: Active CPC Billing Risk/i.test(issues)   && both && clicksGtImpr && cpc > 10;
-    const isBillingRecent   = /🟥\s*BILLING: Recently Expired CPC Risk/i.test(issues) && both && clicksGtImpr && cpc > 10;
-    const isBillingExpired  = /🟥\s*BILLING: Expired CPC Risk/i.test(issues)          && both && clicksGtImpr && cpc > 10;
-
-    // 🟦 DELIVERY (Post-Flight) inclusions you selected
-    // 1) Strict: post-flight + both metrics + clicks>impr + $CPC>10
+    const isPerformance = /🟨\s*PERFORMANCE: CTR ≥ 90% & CPM ≥ \$?10/.test(issues) || (ctrPct >= 90 && cpm >= 10);
+    const isCostBothMetricsClicksGtImpr = /🟩\s*COST: CPC\+CPM Clicks > Impr.*CPC > \$?10/i.test(issues) || (both && clicksGtImpr && cpc > 10);
+    const isBillingActive = /🟥\s*BILLING: Active CPC Billing Risk/i.test(issues) && both && clicksGtImpr && cpc > 10;
+    const isBillingRecent = /🟥\s*BILLING: Recently Expired CPC Risk/i.test(issues) && both && clicksGtImpr && cpc > 10;
+    const isBillingExpired = /🟥\s*BILLING: Expired CPC Risk/i.test(issues) && both && clicksGtImpr && cpc > 10;
     const isDelivStrict = /🟦\s*DELIVERY: Post-Flight Activity/i.test(issues) && isPostFlight && both && clicksGtImpr && cpc > 10;
-    // 2) CPM-only > $10 (post-flight)
     const isDelivCpmOnly = /🟦\s*DELIVERY: Post-Flight Activity/i.test(issues) && isPostFlight && (imp > 0 && clk === 0) && cpm > 10;
-    // 3) General: post-flight, include only if $CPC>10 OR $CPM>10
     const isDelivGeneral = /🟦\s*DELIVERY: Post-Flight Activity/i.test(issues) && isPostFlight && (cpc > 10 || cpm > 10);
 
-    // ❌ Explicit excludes
     const isCpcOnly = /🟩\s*COST:\s*CPC\s*Only\s*>\s*\$?10/i.test(issues) || (imp === 0 && clk > 0 && cpc > 10);
     const isCpmOnly = /🟩\s*COST:\s*CPM\s*Only\s*>\s*\$?10/i.test(issues) || (imp > 0 && clk === 0 && cpm > 10);
     if (isCpcOnly || isCpmOnly) return null;
 
-    // decide bucket (highest priority match wins)
-    if (isPerformance)                    return { bucket: BUCKETS.PERF };
-    if (isCostBothMetricsClicksGtImpr)    return { bucket: BUCKETS.COST_BIMBAL };
-    if (isBillingActive || isBillingRecent || isBillingExpired)
-                                           return { bucket: BUCKETS.BILLING };
-    if (isDelivStrict)                    return { bucket: BUCKETS.DELIV_STRICT };
-    if (isDelivCpmOnly)                   return { bucket: BUCKETS.DELIV_CPM_ONLY };
-    if (isDelivGeneral)                   return { bucket: BUCKETS.DELIV_GENERAL };
+    if (isPerformance) return { bucket: BUCKETS.PERF };
+    if (isCostBothMetricsClicksGtImpr) return { bucket: BUCKETS.COST_BIMBAL };
+    if (isBillingActive || isBillingRecent || isBillingExpired) return { bucket: BUCKETS.BILLING };
+    if (isDelivStrict) return { bucket: BUCKETS.DELIV_STRICT };
+    if (isDelivCpmOnly) return { bucket: BUCKETS.DELIV_CPM_ONLY };
+    if (isDelivGeneral) return { bucket: BUCKETS.DELIV_GENERAL };
 
-    return null; // not included
+    return null;
   }
 
-  // collect rows per owner
   for (let i = 1; i < violations.length; i++) {
     const row = violations[i];
     const q = qualifies_(row);
     if (!q) continue;
 
     const netId = String(row[idx.netId] || "").trim();
-    const adv   = String(row[idx.adv]   || "").trim();
-    const rep   = resolveRep_(ownerMap, netId, adv);
+    const adv = String(row[idx.adv] || "").trim();
+    const rep = resolveRep_(ownerMap, netId, adv);
 
     if (!perOwner[rep]) perOwner[rep] = [];
     perOwner[rep].push({
-      bucket: q.bucket,
-      adv: adv,
-      camp: String(row[idx.camp] || ""),
-      pid:  String(row[idx.pid]  || ""),
-      plc:  String(row[idx.plc]  || ""),
-      imp:  Number(row[idx.impr] || 0),
-      clk:  Number(row[idx.clk]  || 0),
-      issue:String(row[idx.issues] || "")
+      bucket: q.bucket, adv: adv, camp: String(row[idx.camp] || ""),
+      pid: String(row[idx.pid] || ""), plc: String(row[idx.plc] || ""),
+      imp: Number(row[idx.impr] || 0), clk: Number(row[idx.clk] || 0),
+      issue: String(row[idx.issues] || "")
     });
   }
 
-  const owners = Object.keys(perOwner).sort((a,b)=> a.toLowerCase().localeCompare(b.toLowerCase()));
-  if (!owners.length) return "";
+  const owners = Object.keys(perOwner).sort(function(a,b){ return a.toLowerCase().localeCompare(b.toLowerCase()); });
+  
+  return { owners: owners, perOwner: perOwner };
+}
 
-  let html = "<p><b>Immediate Attention — Key Issues (by Owner)</b></p>";
+function buildImmediateAttentionHtmlForOwners_(owners, perOwner) {
+  const MAX_ROWS_PER_OWNER = 30;
+  const MAX_TOTAL_OWNER_ROWS = 1000;
+  
+  let html = '';
   let totalRows = 0;
 
-  for (const rep of owners) {
+  for (let i = 0; i < owners.length; i++) {
+    const rep = owners[i];
     if (totalRows >= MAX_TOTAL_OWNER_ROWS) break;
+    
     const arr = perOwner[rep];
-
-    // sort: bucket → advertiser A–Z → clicks desc → impressions desc → placement id
     arr.sort(function(a, b){
       if (a.bucket !== b.bucket) return a.bucket - b.bucket;
       const aAdv = String(a.adv||"").toLowerCase(), bAdv = String(b.adv||"").toLowerCase();
@@ -1430,10 +1834,10 @@ function sendEmailSummary() {
          +  '<th>Advertiser</th><th>Campaign</th><th>Placement ID</th><th>Placement</th><th>Impr</th><th>Clicks</th><th>Issue(s)</th>'
          +  '</tr>';
 
-    for (let i = 0; i < take; i++) {
-      const o = arr[i];
+    for (let j = 0; j < take; j++) {
+      const o = arr[j];
       const campShort = o.camp.length > 40 ? o.camp.substring(0, 40) + "…" : o.camp;
-      const plcShort  = o.plc.length  > 30 ? o.plc.substring(0, 30)  + "…" : o.plc;
+      const plcShort = o.plc.length > 30 ? o.plc.substring(0, 30) + "…" : o.plc;
       html += "<tr>"
            +  "<td>" + o.adv + "</td>"
            +  "<td>" + campShort + "</td>"
@@ -1449,90 +1853,6 @@ function sendEmailSummary() {
 
   return html;
 }
-
-const immediateAttentionHtml = buildImmediateAttentionByOwner_(); // still inside sendEmailSummary()
-
-
-  // --- Stale metrics (unchanged) ---
-  const thresholdDays = getStaleThresholdDays_();
-  let staleImp = 0, staleClk = 0;
-  const impIdx = hMap["Last Imp Change"], clkIdx = hMap["Last Click Change"];
-  if (impIdx !== undefined || clkIdx !== undefined) {
-    for (let i = 1; i < violations.length; i++) {
-      const r = violations[i];
-      const impDays = impIdx !== undefined ? Number(r[impIdx]) : NaN;
-      const clkDays = clkIdx !== undefined ? Number(r[clkIdx]) : NaN;
-      if (isFinite(impDays) && impDays >= thresholdDays) staleImp++;
-      if (isFinite(clkDays) && clkDays >= thresholdDays) staleClk++;
-    }
-  }
-  const staleHtml =
-      "<b>Stale Metrics (this month)</b><ul>"
-    + "<li>Placements with no new impressions since last change (≥ " + thresholdDays + " days): " + staleImp + "</li>"
-    + "<li>Placements with no new clicks since last change (≥ " + thresholdDays + " days): " + staleClk + "</li>"
-    + "</ul>";
-
-  // Appendix (optional)
-  const violationsAppendixHtml =
-      '<p><b>What the Violations tab tracks</b></p>'
-    + '<ul>'
-    + '<li><b>🟥 BILLING</b><ul>'
-    + '<li><b>Expired CPC Risk</b> — Ended before this month and clicks &gt; impressions.</li>'
-    + '<li><b>Recently Expired CPC Risk</b> — Ended earlier this month and still clicks &gt; impressions.</li>'
-    + '<li><b>Active CPC Billing Risk</b> — Active (report date ≤ end date), clicks &gt; impressions, and $CPC &gt; $10.</li>'
-    + '</ul></li>'
-    + '<li><b>🟦 DELIVERY</b><ul>'
-    + '<li><b>Post-Flight Activity</b> — Ended before this month but shows impressions or clicks this month.</li>'
-    + '</ul></li>'
-    + '<li><b>🟨 PERFORMANCE</b><ul>'
-    + '<li><b>CTR ≥ 90% &amp; CPM ≥ $10</b> — Extreme CTR with meaningful CPM spend.</li>'
-    + '</ul></li>'
-    + '<li><b>🟩 COST</b><ul>'
-    + '<li><b>CPC Only &gt; $10</b> — No CPM spend and $CPC &gt; $10.</li>'
-    + '<li><b>CPM Only &gt; $10</b> — No CPC spend and $CPM &gt; $10.</li>'
-    + '<li><b>CPC+CPM Clicks &gt; Impr &amp; CPC &gt; $10</b> — Both CPC &amp; CPM, clicks &gt; impressions, and $CPC &gt; $10.</li>'
-    + '<li><i>(Low Priority tags exist in attachment but are excluded from this section)</i></li>'
-    + '</ul></li>'
-    + '</ul>';
-
-  // Attachment
-  const todayformatted = Utilities.formatDate(today, Session.getScriptTimeZone(), "M.d.yy");
-  const fileName = "CM360_QA_Violations_" + todayformatted + ".xlsx";
-  const xlsxBlob = createXLSXFromSheet(sheet).setName(fileName);
-
-  // Generate mid-flight drop alert HTML (for post-15th inclusion)
-  const midFlightHtml = generateMidFlightDropHtml_();
-
-  // Assemble body
-  const subject = "CM360 CPC/CPM FLIGHT QA – " + todayformatted;
-  let htmlBody =
-      networkSummary
-    + '<p>The below is a table of the following Billing, Delivery, Performance and Cost issues:</p>'
-    + summaryHtml
-    + (immediateAttentionHtml ? ('<br/>' + immediateAttentionHtml) : '')
-    + (midFlightHtml ? ('<br/>' + midFlightHtml) : '')
-    + '<br/>' + staleHtml
-    + (INCLUDE_APPENDIX ? ('<br/>' + violationsAppendixHtml) : '')
-    + '<p><i>Brought to you by the Platform Solutions Automation. (Made by: BK)</i></p>';
-
-  // Safety trim if needed
-  if (htmlBody.length > MAX_HTML_CHARS) {
-    htmlBody = htmlBody.slice(0, MAX_HTML_CHARS - 1200)
-             + '<p><i>(trimmed for size — full detail in the attached XLSX)</i></p>';
-  }
-
-  // Send
-  uniqueEmails.forEach(function(addr){
-    try {
-      MailApp.sendEmail({ to: addr, subject: subject, htmlBody: htmlBody, attachments: [xlsxBlob] });
-      Utilities.sleep(300);
-    } catch (err) {
-      Logger.log("Failed to email " + addr + ": " + err);
-    }
-  });
-}
-
-
 
 function fmtMs_(ms) {
   if (ms < 0) ms = 0;
@@ -1611,8 +1931,10 @@ function runItAll() {
 // runItAllMorning (no email, for time-driven trigger)
 // ---------------------
 function runItAllMorning() {
-  var APPROX_QUOTA_MINUTES = 6; // same budget, but we stop before email
+  var APPROX_QUOTA_MINUTES = 6;
   var runStart = Date.now();
+  const isAuto = !isManualRun_();
+  
   Logger.log('🚀 runItAllMorning — START @ ' + new Date(runStart).toISOString()
              + ' (approx quota: ' + APPROX_QUOTA_MINUTES + ' min)');
 
@@ -1628,10 +1950,11 @@ function runItAllMorning() {
 
     if (timeLeft < 2 * 60 * 1000) {
       Logger.log('⏭ Not enough time left for QA (' + Math.floor(timeLeft/1000) + 's). Scheduling QA handoff.');
-      clearQAState_();           // ensure a fresh QA session
-      cancelQAChunkTrigger_();   // clear any stale chunk trigger
-      scheduleNextQAChunk_(1);   // kick off the first QA chunk shortly
-      return;                    // exit cleanly to avoid hitting the 6-min wall
+      clearQAState_();
+      cancelQAChunkTrigger_();
+      scheduleNextQAChunk_(1);
+      logAuditEntry_('runItAllMorning', 'PARTIAL_HANDOFF', Date.now() - runStart, null, null, 'Handed off to QA chunks');
+      return;
     }
 
     // 3) Run at most one QA chunk now
@@ -1641,6 +1964,17 @@ function runItAllMorning() {
     logStep_('sendPerformanceSpikeAlertIfPre15', function(){ sendPerformanceSpikeAlertIfPre15(); }, runStart, APPROX_QUOTA_MINUTES);
 
     // ❌ NO sendEmailSummary here — that gets its own trigger/window
+    
+    logAuditEntry_('runItAllMorning', 'SUCCESS', Date.now() - runStart, null, null, null);
+  } catch (e) {
+    Logger.log('❌ runItAllMorning failed: ' + e.message);
+    if (isAuto) {
+      sendFailureEmail_('runItAllMorning', e, {
+        stage: 'morning execution',
+        duration: fmtMs_(Date.now() - runStart)
+      });
+    }
+    throw e;
   } finally {
     var totalMs = Date.now() - runStart;
     Logger.log('🏁 runItAllMorning — FINISHED in ' + fmtMs_(totalMs));
@@ -1653,6 +1987,8 @@ function runItAllMorning() {
 function runDailyEmailSummary() {
   var APPROX_QUOTA_MINUTES = 6;
   var runStart = Date.now();
+  const isAuto = !isManualRun_();
+  
   Logger.log('🚀 runDailyEmailSummary — START @ ' + new Date(runStart).toISOString()
              + ' (approx quota: ' + APPROX_QUOTA_MINUTES + ' min)');
 
@@ -1660,7 +1996,17 @@ function runDailyEmailSummary() {
     // sendEmailSummary already:
     //  - skips if QA still has an active session
     //  - skips before the 15th of the month
+    //  - supports chunked execution
     logStep_('sendEmailSummary', function(){ sendEmailSummary(); }, runStart, APPROX_QUOTA_MINUTES);
+  } catch (e) {
+    Logger.log('❌ runDailyEmailSummary failed: ' + e.message);
+    if (isAuto) {
+      sendFailureEmail_('runDailyEmailSummary', e, {
+        stage: 'email execution',
+        duration: fmtMs_(Date.now() - runStart)
+      });
+    }
+    throw e;
   } finally {
     var totalMs = Date.now() - runStart;
     Logger.log('🏁 runDailyEmailSummary — FINISHED in ' + fmtMs_(totalMs));
@@ -1996,6 +2342,173 @@ function sendMidFlightDropAlert() {
 // ---------------------
 function arrayToCsv(data) {
   return data.map(function(row){ return row.map(function(cell){ return '"' + cell + '"'; }).join(","); }).join("\n");
+}
+
+// ====== Manual Immediate Mode Functions (No Chunking) ======
+function runQAOnlyImmediate() {
+  const startTime = Date.now();
+  Logger.log('🏃 runQAOnlyImmediate - Manual immediate mode (no chunking)');
+  
+  // Clear any existing state to prevent confusion
+  clearQAState_();
+  cancelQAChunkTrigger_();
+  
+  // Run the original QA logic without chunking - just process everything
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const raw = ss.getSheetByName("Raw Data");
+  const out = ss.getSheetByName("Violations");
+  if (!raw || !out) {
+    Logger.log('❌ Missing required sheets');
+    return;
+  }
+
+  const data = raw.getDataRange().getValues();
+  if (!data || data.length <= 1) {
+    Logger.log('⚠️ No data to process');
+    return;
+  }
+
+  clearViolations();
+  
+  Logger.log('Processing ' + (data.length - 1) + ' rows immediately...');
+  
+  // Set up a fake state that processes all rows
+  const state = { session: String(Date.now()), next: 2, totalRows: data.length - 1 };
+  saveQAState_(state);
+  
+  // Call the regular runQAOnly but it will try to process everything in one go
+  // This will timeout if too large, but user will see exactly where
+  runQAOnly();
+  
+  const duration = Date.now() - startTime;
+  Logger.log('✅ runQAOnlyImmediate completed in ' + fmtMs_(duration));
+}
+
+function sendEmailSummaryImmediate() {
+  const startTime = Date.now();
+  Logger.log('🏃 sendEmailSummaryImmediate - Manual immediate mode (no chunking)');
+  
+  // Clear any existing state
+  clearEmailState_();
+  cancelEmailChunkTrigger_();
+  
+  // Call the chunked version but tell it not to chunk
+  try {
+    sendEmailSummaryChunked_(false);
+    const duration = Date.now() - startTime;
+    Logger.log('✅ sendEmailSummaryImmediate completed in ' + fmtMs_(duration));
+  } catch (e) {
+    Logger.log('❌ sendEmailSummaryImmediate failed: ' + e.message);
+    throw e;
+  }
+}
+
+function importDCMReportsChunked() {
+  Logger.log('🏃 importDCMReportsChunked - Auto-resume mode');
+  // For now, importDCMReports is fast enough (1m 7s), so just call it
+  // Could add chunking later if needed
+  importDCMReports();
+}
+
+function runItAllChunked() {
+  Logger.log('🏃 runItAllChunked - Manual auto-resume mode');
+  // Just call the regular runItAllMorning which already supports chunking
+  runItAllMorning();
+}
+
+// ====== System Status & Management Functions ======
+function showSystemStatus() {
+  const ui = SpreadsheetApp.getUi();
+  
+  const qaState = getQAState_();
+  const emailState = getEmailState_();
+  
+  let status = '📊 CM360 QA System Status\n\n';
+  
+  // QA Status
+  if (qaState && qaState.session) {
+    const progress = Math.round((qaState.next / qaState.totalRows) * 100);
+    status += '🔄 QA IN PROGRESS\n';
+    status += '  Progress: ' + qaState.next + ' / ' + qaState.totalRows + ' (' + progress + '%)\n';
+    status += '  Session: ' + new Date(Number(qaState.session)).toLocaleString() + '\n\n';
+  } else {
+    status += '✅ QA Idle\n\n';
+  }
+  
+  // Email Status
+  if (emailState && emailState.session) {
+    status += '🔄 EMAIL GENERATION IN PROGRESS\n';
+    status += '  Stage: ' + (emailState.stage || 'unknown') + '\n';
+    status += '  Session: ' + new Date(Number(emailState.session)).toLocaleString() + '\n\n';
+  } else {
+    status += '✅ Email Idle\n\n';
+  }
+  
+  // Check for scheduled triggers
+  const triggers = ScriptApp.getProjectTriggers();
+  const qaTriggersCount = triggers.filter(function(t){ return t.getHandlerFunction() === 'runQAOnly'; }).length;
+  const emailTriggersCount = triggers.filter(function(t){ return t.getHandlerFunction() === 'sendEmailSummary'; }).length;
+  
+  if (qaTriggersCount > 0) {
+    status += '⏰ ' + qaTriggersCount + ' QA resume trigger(s) scheduled\n';
+  }
+  if (emailTriggersCount > 0) {
+    status += '⏰ ' + emailTriggersCount + ' Email resume trigger(s) scheduled\n';
+  }
+  
+  // Last audit entries
+  try {
+    const auditSheet = getAuditSheet_();
+    const lastRow = auditSheet.getLastRow();
+    if (lastRow > 1) {
+      const recent = auditSheet.getRange(Math.max(2, lastRow - 2), 1, Math.min(3, lastRow - 1), 4).getValues();
+      status += '\n📋 Recent Executions:\n';
+      recent.forEach(function(r){
+        const ts = Utilities.formatDate(new Date(r[0]), Session.getScriptTimeZone(), 'M/d HH:mm');
+        status += '  ' + ts + ' - ' + r[1] + ': ' + r[2] + ' (' + r[3] + ')\n';
+      });
+    }
+  } catch (e) {
+    status += '\n⚠️ Could not load audit log\n';
+  }
+  
+  ui.alert('System Status', status, ui.ButtonSet.OK);
+}
+
+function resetAllState() {
+  const ui = SpreadsheetApp.getUi();
+  const response = ui.alert(
+    'Reset All State',
+    'This will clear all execution state and cancel pending triggers.\n\nUse this if the system is stuck.\n\nContinue?',
+    ui.ButtonSet.YES_NO
+  );
+  
+  if (response === ui.Button.YES) {
+    clearQAState_();
+    clearEmailState_();
+    cancelQAChunkTrigger_();
+    cancelEmailChunkTrigger_();
+    
+    // Cancel any orphaned triggers
+    const triggers = ScriptApp.getProjectTriggers();
+    triggers.forEach(function(t){
+      const fn = t.getHandlerFunction();
+      if (fn === 'runQAOnly' || fn === 'sendEmailSummary') {
+        const props = getScriptProps_();
+        const qaId = props.getProperty(QA_TRIGGER_KEY);
+        const emailId = props.getProperty(EMAIL_TRIGGER_KEY);
+        const id = t.getUniqueId();
+        
+        // Only delete if not the main daily triggers
+        if (id !== qaId && id !== emailId && t.getEventType() === ScriptApp.EventType.CLOCK) {
+          ScriptApp.deleteTrigger(t);
+        }
+      }
+    });
+    
+    ui.alert('✅ Reset Complete', 'All execution state cleared and triggers canceled.', ui.ButtonSet.OK);
+    Logger.log('✅ Manual reset completed');
+  }
 }
 
 // ---------------------
