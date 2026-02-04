@@ -1,0 +1,14 @@
+# clasp
+.clasp.json
+.claspignore
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
+
+# Logs
+*.log

@@ -19,12 +19,20 @@ function onOpen() {
     .addItem("Run QA Only (Auto-Resume)", "runQAOnly")
     .addItem("Send Email Only (Immediate)", "sendEmailSummaryImmediate")
     .addItem("Send Email Only (Auto-Resume)", "sendEmailSummary")
+    .addItem("FORCE Send Email Now", "sendEmailNow")
     .addSeparator()
-    .addItem("📊 System Status", "showSystemStatus")
+    .addItem("� Debug QA Filtering", "debugQAFiltering")
+    .addItem("🔍 Count Non-Zero Rows", "countNonZeroRows")
+    .addSeparator()
+    .addItem("�📊 System Status", "showSystemStatus")
     .addItem("🔄 Reset All State (if stuck)", "resetAllState")
     .addSeparator()
     .addItem("Authorize Email (one-time)", "authorizeMail_")
     .addItem("Create Daily Email Trigger (9am)", "createDailyEmailTrigger")
+    .addItem("Create Reply Processor Trigger (7am)", "createReplyProcessorTrigger")
+    .addSeparator()
+    .addItem("Process Email Replies (Manual)", "processEmailReplies")
+    .addItem("Clear Handled Placements", "clearHandledPlacements")
     .addSeparator()
     .addItem("Clear Violations", "clearViolations")
     .addToUi();
@@ -56,6 +64,19 @@ function createDailyEmailTrigger() {
     .create();
 }
 
+// ---------------------
+// Create an installable time trigger for processing email replies
+// ---------------------
+function createReplyProcessorTrigger() {
+  // Runs processEmailReplies daily at 7am (before data pull)
+  ScriptApp.newTrigger('processEmailReplies')
+    .timeBased()
+    .atHour(7)
+    .everyDays(1)
+    .create();
+  SpreadsheetApp.getUi().alert('✅ Reply processor trigger created. Will run daily at 7am.');
+}
+
 
 
 
@@ -68,6 +89,454 @@ function clearViolations() {
   const lastRow = sheet.getLastRow();
   if (lastRow > 1) {
     sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).clearContent();
+  }
+}
+
+// ---------------------
+// clearHandledPlacements
+// ---------------------
+function clearHandledPlacements() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Handled Placements");
+  if (!sheet) return;
+  const lastRow = sheet.getLastRow();
+  if (lastRow > 1) {
+    sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).clearContent();
+  }
+  SpreadsheetApp.getUi().alert('✅ Handled Placements cleared');
+}
+
+// ---------------------
+// processEmailReplies - Main function to parse email replies
+// ---------------------
+function processEmailReplies() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const violationsSheet = ss.getSheetByName("Violations");
+  
+  // Get or create Handled Placements sheet
+  let handledSheet = ss.getSheetByName("Handled Placements");
+  if (!handledSheet) {
+    handledSheet = ss.insertSheet("Handled Placements");
+    const headers = [
+      "Advertiser", "Campaign", "Placement ID", "Placement", "Impr", "Clicks", 
+      "Issue(s)", "Note", "Note-Date Last Updated", "Email Addresses"
+    ];
+    handledSheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+    handledSheet.getRange(1, 1, 1, headers.length).setFontWeight("bold");
+  }
+  
+  if (!violationsSheet) {
+    Logger.log("❌ Violations sheet not found");
+    return;
+  }
+  
+  // Auto-clear on first of month
+  const today = new Date();
+  if (today.getDate() === 1) {
+    Logger.log("🗓️ First of month - clearing Handled Placements");
+    const lastRow = handledSheet.getLastRow();
+    if (lastRow > 1) {
+      handledSheet.getRange(2, 1, lastRow - 1, handledSheet.getLastColumn()).clearContent();
+    }
+  }
+  
+  // Search for reply emails this month
+  const startOfMonth = new Date(today.getFullYear(), today.getMonth(), 1);
+  const formattedStart = Utilities.formatDate(startOfMonth, Session.getScriptTimeZone(), "yyyy/MM/dd");
+  
+  const searchQuery = 'subject:"Re: CM360 CPC/CPM FLIGHT QA" after:' + formattedStart;
+  const threads = GmailApp.search(searchQuery);
+  
+  Logger.log("📧 Found " + threads.length + " reply threads");
+  
+  let processedCount = 0;
+  let networksRemovedCount = 0;
+  let errorCount = 0;
+  
+  threads.forEach(function(thread) {
+    const messages = thread.getMessages();
+    
+    // Process each message in the thread
+    messages.forEach(function(message) {
+      // Only process replies (not the original email)
+      if (!message.getSubject().startsWith("Re:")) return;
+      
+      const sender = message.getFrom();
+      const messageDate = message.getDate();
+      const body = message.getPlainBody();
+      
+      // Parse the email body
+      const parseResult = parseReplyEmail_(body);
+      
+      if (parseResult.error) {
+        Logger.log("❌ Parse error from " + sender + ": " + parseResult.error);
+        sendReplyErrorEmail_(sender, parseResult.error);
+        errorCount++;
+        return;
+      }
+      
+      // Handle REMOVE NETWORK commands
+      if (parseResult.type === 'REMOVE_NETWORK') {
+        const removed = removeNetworks_(parseResult.networkIds, sender);
+        networksRemovedCount += removed;
+        Logger.log("🗑️ " + sender + " removed " + removed + " network(s): " + parseResult.networkIds.join(", "));
+        return;
+      }
+      
+      // Handle placement notes
+      if (parseResult.type === 'HANDLE_PLACEMENT' && parseResult.placementIds.length > 0) {
+        const result = storeHandledPlacements_(
+          parseResult.placementIds,
+          parseResult.note,
+          sender,
+          messageDate,
+          violationsSheet,
+          handledSheet
+        );
+        
+        processedCount += result.stored;
+        
+        if (result.invalid.length > 0) {
+          Logger.log("⚠️ Invalid placement IDs from " + sender + ": " + result.invalid.join(", "));
+        }
+      }
+    });
+  });
+  
+  Logger.log("✅ Processed " + processedCount + " placement notes from email replies");
+  if (networksRemovedCount > 0) {
+    Logger.log("✅ Removed " + networksRemovedCount + " network(s) from monitoring");
+  }
+  if (errorCount > 0) {
+    Logger.log("⚠️ " + errorCount + " emails had errors");
+  }
+}
+
+// ---------------------
+// parseReplyEmail_ - Extract note and placement IDs from email body
+// ---------------------
+function parseReplyEmail_(body) {
+  // Stop parsing at signature markers
+  const stopMarkers = [
+    '[[#]]',
+    'From:',
+    'Sent:',
+    '________________________________',
+    'Get Outlook for',
+    'Sent from'
+  ];
+  
+  let cleanBody = body;
+  
+  // Find earliest stop marker
+  let stopIndex = cleanBody.length;
+  stopMarkers.forEach(function(marker) {
+    const idx = cleanBody.indexOf(marker);
+    if (idx !== -1 && idx < stopIndex) {
+      stopIndex = idx;
+    }
+  });
+  
+  cleanBody = cleanBody.substring(0, stopIndex).trim();
+  
+  // Also stop at quoted reply (lines starting with >)
+  const lines = cleanBody.split('\n');
+  const relevantLines = [];
+  
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    // Stop at quoted replies
+    if (line.startsWith('>') || line.startsWith('On ') && line.includes('wrote:')) {
+      break;
+    }
+    if (line) {
+      relevantLines.push(line);
+    }
+  }
+  
+  if (relevantLines.length === 0) {
+    return { error: null, note: null, placementIds: [], networkIds: [], type: null };
+  }
+  
+  // Check if this is a REMOVE NETWORK command
+  const networkIdsToRemove = [];
+  for (let i = 0; i < relevantLines.length; i++) {
+    const line = relevantLines[i].trim();
+    const match = line.match(/^REMOVE\s+NETWORK\s+(\d+)$/i);
+    if (match) {
+      networkIdsToRemove.push(match[1]);
+    }
+  }
+  
+  if (networkIdsToRemove.length > 0) {
+    return { 
+      error: null, 
+      type: 'REMOVE_NETWORK', 
+      networkIds: networkIdsToRemove,
+      note: null,
+      placementIds: []
+    };
+  }
+  
+  // Otherwise, parse as placement handling (note first, then placement IDs)
+  const note = relevantLines[0];
+  
+  // Rest should be placement IDs
+  const placementIds = [];
+  for (let i = 1; i < relevantLines.length; i++) {
+    const line = relevantLines[i].trim();
+    // Check if it's a number
+    if (/^\d+$/.test(line)) {
+      placementIds.push(line);
+    }
+  }
+  
+  // Validation: must have both note and at least one placement ID
+  if (placementIds.length === 0) {
+    return { 
+      error: "No placement IDs found. Please format your reply as:\n\nYour note here\n12345678\n87654321\n\nwhere the first line is your note and subsequent lines are placement IDs.",
+      note: null,
+      placementIds: [],
+      networkIds: [],
+      type: null
+    };
+  }
+  
+  return { error: null, type: 'HANDLE_PLACEMENT', note: note, placementIds: placementIds, networkIds: [] };
+}
+
+// ---------------------
+// storeHandledPlacements_ - Validate and store placement notes
+// ---------------------
+function storeHandledPlacements_(placementIds, note, sender, messageDate, violationsSheet, handledSheet) {
+  const violations = violationsSheet.getDataRange().getValues();
+  const vHeaders = violations[0];
+  
+  // Build a map of placement ID to violation data
+  const placementMap = {};
+  const placementIdCol = vHeaders.indexOf("Placement ID");
+  
+  for (let i = 1; i < violations.length; i++) {
+    const row = violations[i];
+    const pid = String(row[placementIdCol] || "").trim();
+    if (pid) {
+      placementMap[pid] = {
+        advertiser: row[vHeaders.indexOf("Advertiser")],
+        campaign: row[vHeaders.indexOf("Campaign")],
+        placementId: pid,
+        placement: row[vHeaders.indexOf("Placement")],
+        impr: row[vHeaders.indexOf("Impressions")],
+        clicks: row[vHeaders.indexOf("Clicks")],
+        issues: row[vHeaders.indexOf("Issue Type")]
+      };
+    }
+  }
+  
+  // Get existing handled placements
+  const handledData = handledSheet.getDataRange().getValues();
+  const hHeaders = handledData[0];
+  const handledMap = {};
+  
+  for (let i = 1; i < handledData.length; i++) {
+    const row = handledData[i];
+    const pid = String(row[hHeaders.indexOf("Placement ID")] || "").trim();
+    if (pid) {
+      handledMap[pid] = {
+        rowIndex: i + 1,
+        emails: String(row[hHeaders.indexOf("Email Addresses")] || "").trim()
+      };
+    }
+  }
+  
+  const dateStr = Utilities.formatDate(messageDate, Session.getScriptTimeZone(), "yyyy-MM-dd HH:mm");
+  const senderEmail = extractEmail_(sender);
+  
+  let stored = 0;
+  const invalid = [];
+  
+  placementIds.forEach(function(pid) {
+    // Validate: must exist in Violations
+    if (!placementMap[pid]) {
+      invalid.push(pid);
+      return;
+    }
+    
+    const vData = placementMap[pid];
+    
+    // Check if already handled
+    if (handledMap[pid]) {
+      // Update existing: append email if not already there, update note and date
+      const rowIdx = handledMap[pid].rowIndex;
+      const existingEmails = handledMap[pid].emails;
+      
+      let emailList = existingEmails ? existingEmails.split(", ") : [];
+      if (emailList.indexOf(senderEmail) === -1) {
+        emailList.push(senderEmail);
+      }
+      
+      handledSheet.getRange(rowIdx, hHeaders.indexOf("Note") + 1).setValue(note);
+      handledSheet.getRange(rowIdx, hHeaders.indexOf("Note-Date Last Updated") + 1).setValue(dateStr);
+      handledSheet.getRange(rowIdx, hHeaders.indexOf("Email Addresses") + 1).setValue(emailList.join(", "));
+    } else {
+      // Add new row
+      const newRow = [
+        vData.advertiser,
+        vData.campaign,
+        vData.placementId,
+        vData.placement,
+        vData.impr,
+        vData.clicks,
+        vData.issues,
+        note,
+        dateStr,
+        senderEmail
+      ];
+      handledSheet.appendRow(newRow);
+    }
+    
+    stored++;
+  });
+  
+  return { stored: stored, invalid: invalid };
+}
+
+// ---------------------
+// getOrCreateMonitoredNetworks_ - Get or create Monitored Networks sheet
+// ---------------------
+function getOrCreateMonitoredNetworks_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName("Monitored Networks");
+  
+  if (!sheet) {
+    sheet = ss.insertSheet("Monitored Networks");
+    const headers = ["Network ID", "Network Name", "Date Added"];
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+    sheet.getRange(1, 1, 1, headers.length).setFontWeight("bold");
+  }
+  
+  return sheet;
+}
+
+// ---------------------
+// syncMonitoredNetworks_ - Auto-add new networks from Raw Data
+// ---------------------
+function syncMonitoredNetworks_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const rawSheet = ss.getSheetByName("Raw Data");
+  if (!rawSheet || rawSheet.getLastRow() <= 1) return;
+  
+  const monitoredSheet = getOrCreateMonitoredNetworks_();
+  const rawData = rawSheet.getDataRange().getValues();
+  const rHeaders = rawData[0];
+  const netIdCol = rHeaders.indexOf("Network ID");
+  
+  // Get existing monitored networks
+  const monitoredData = monitoredSheet.getDataRange().getValues();
+  const existingIds = {};
+  for (let i = 1; i < monitoredData.length; i++) {
+    const id = String(monitoredData[i][0] || "").trim();
+    if (id) existingIds[id] = true;
+  }
+  
+  // Find new network IDs
+  const newNetworks = {};
+  for (let i = 1; i < rawData.length; i++) {
+    const netId = String(rawData[i][netIdCol] || "").trim();
+    if (netId && !existingIds[netId] && !newNetworks[netId]) {
+      newNetworks[netId] = true;
+    }
+  }
+  
+  // Add new networks
+  const today = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd");
+  Object.keys(newNetworks).forEach(function(netId) {
+    monitoredSheet.appendRow([netId, "TO BE ADDED", today]);
+    Logger.log("📋 Auto-added network " + netId + " to monitoring");
+  });
+}
+
+// ---------------------
+// getMonitoredNetworkIds_ - Get list of monitored network IDs
+// ---------------------
+function getMonitoredNetworkIds_() {
+  const sheet = getOrCreateMonitoredNetworks_();
+  const data = sheet.getDataRange().getValues();
+  const ids = [];
+  
+  for (let i = 1; i < data.length; i++) {
+    const id = String(data[i][0] || "").trim();
+    if (id) ids.push(id);
+  }
+  
+  return ids;
+}
+
+// ---------------------
+// removeNetworks_ - Remove networks from monitoring
+// ---------------------
+function removeNetworks_(networkIds, sender) {
+  const sheet = getOrCreateMonitoredNetworks_();
+  const data = sheet.getDataRange().getValues();
+  
+  let removed = 0;
+  // Go backwards to avoid index shifting
+  for (let i = data.length - 1; i >= 1; i--) {
+    const id = String(data[i][0] || "").trim();
+    if (networkIds.indexOf(id) !== -1) {
+      sheet.deleteRow(i + 1);
+      removed++;
+      Logger.log("🗑️ Removed network " + id + " (requested by " + sender + ")");
+    }
+  }
+  
+  return removed;
+}
+
+// ---------------------
+// extractEmail_ - Extract email address from "Name <email>" format
+// ---------------------
+function extractEmail_(fromString) {
+  const match = fromString.match(/<([^>]+)>/);
+  return match ? match[1] : fromString;
+}
+
+// ---------------------
+// sendReplyErrorEmail_ - Notify user of parsing error
+// ---------------------
+function sendReplyErrorEmail_(recipient, errorMessage) {
+  const recipientEmail = extractEmail_(recipient);
+  
+  const subject = "⚠️ CM360 QA - Reply Format Error";
+  const body = '<html><body style="font-family: Arial, sans-serif;">'
+    + '<h2 style="color: #d9534f;">⚠️ Email Reply Format Error</h2>'
+    + '<p>Your email reply could not be processed due to a formatting issue:</p>'
+    + '<p style="color: #d9534f; font-weight: bold;">' + errorMessage + '</p>'
+    + '<hr/>'
+    + '<h3>Correct Format:</h3>'
+    + '<pre style="background: #f5f5f5; padding: 10px;">'
+    + 'Your note describing what was done\n'
+    + '12345678\n'
+    + '87654321\n'
+    + '98765432'
+    + '</pre>'
+    + '<p><b>Important:</b></p>'
+    + '<ul>'
+    + '<li>First line should be your note (e.g., "Handled by digital", "Addressed with billing team")</li>'
+    + '<li>Following lines should be placement IDs, one per line</li>'
+    + '<li>Only include placement IDs that are currently in the violations report</li>'
+    + '</ul>'
+    + '<p>Please reply again with the correct format.</p>'
+    + '<hr/>'
+    + '<p style="color: #666; font-size: 11px;"><i>Automated notification from CM360 QA Tools</i></p>'
+    + '</body></html>';
+  
+  try {
+    MailApp.sendEmail({
+      to: recipientEmail,
+      subject: subject,
+      htmlBody: body
+    });
+  } catch (e) {
+    Logger.log("❌ Failed to send error email to " + recipientEmail + ": " + e.message);
   }
 }
 
@@ -139,6 +608,78 @@ function importDCMReports() {
   if (extractedData.length) {
     dataSheet.getRange(2, 1, extractedData.length, dataHeaders.length).setValues(extractedData);
   }
+  
+  // Sync monitored networks after import
+  syncMonitoredNetworks_();
+  
+  // Auto-add new networks to Networks tab
+  autoAddNewNetworks_();
+}
+
+// ====== Auto-add new networks to Networks tab ======
+function autoAddNewNetworks_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const rawDataSheet = ss.getSheetByName("Raw Data");
+  const networksSheet = ss.getSheetByName("Networks");
+  
+  if (!rawDataSheet || !networksSheet) {
+    Logger.log("autoAddNewNetworks_: Required sheets not found");
+    return;
+  }
+  
+  // Get all Network IDs from Raw Data (column A, skip header)
+  const rawDataLastRow = rawDataSheet.getLastRow();
+  if (rawDataLastRow < 2) {
+    Logger.log("autoAddNewNetworks_: No data in Raw Data sheet");
+    return;
+  }
+  
+  const rawNetworkIds = rawDataSheet.getRange(2, 1, rawDataLastRow - 1, 1).getValues()
+    .map(function(row){ return String(row[0] || "").trim(); })
+    .filter(function(id){ return id && id !== "Unknown"; });
+  
+  // Get unique Network IDs
+  const uniqueRawNetIds = {};
+  rawNetworkIds.forEach(function(id){ uniqueRawNetIds[id] = true; });
+  const uniqueRawNetIdList = Object.keys(uniqueRawNetIds);
+  
+  if (uniqueRawNetIdList.length === 0) {
+    Logger.log("autoAddNewNetworks_: No valid Network IDs in Raw Data");
+    return;
+  }
+  
+  // Get existing Network IDs from Networks tab (column A, skip header)
+  const networksLastRow = networksSheet.getLastRow();
+  const existingNetIds = {};
+  
+  if (networksLastRow >= 2) {
+    const existingData = networksSheet.getRange(2, 1, networksLastRow - 1, 1).getValues();
+    existingData.forEach(function(row){
+      const id = String(row[0] || "").trim();
+      if (id) existingNetIds[id] = true;
+    });
+  }
+  
+  // Find new Network IDs that need to be added
+  const newNetIds = uniqueRawNetIdList.filter(function(id){
+    return !existingNetIds[id];
+  });
+  
+  if (newNetIds.length === 0) {
+    Logger.log("autoAddNewNetworks_: No new networks to add");
+    return;
+  }
+  
+  // Append new networks to Networks tab
+  // Format: [Network ID (A), "TO BE ADDED" (B)]
+  const newRows = newNetIds.map(function(id){
+    return [id, "TO BE ADDED"];
+  });
+  
+  const nextRow = networksSheet.getLastRow() + 1;
+  networksSheet.getRange(nextRow, 1, newRows.length, 2).setValues(newRows);
+  
+  Logger.log("autoAddNewNetworks_: Added " + newNetIds.length + " new network(s): " + newNetIds.join(", "));
 }
 
 // ====== Chunked QA execution control ======
@@ -417,29 +958,40 @@ function loadLatestCacheMap_() {
 
 // Appends today's snapshots for all evaluated rows
 function appendTodaySnapshots_(rowsForSnapshot) {
+  const funcStart = Date.now();
+  Logger.log('      🔍 appendTodaySnapshots_: Adding ' + rowsForSnapshot.length + ' snapshots...');
   if (!rowsForSnapshot.length) return;
   const sh = getPerfAlertCacheSheet_();
   const tz = Session.getScriptTimeZone();
   const todayStr = Utilities.formatDate(new Date(), tz, "yyyy-MM-dd");
   const out = rowsForSnapshot.map(function(r){ return [todayStr, r.key, r.imp, r.clk]; });
   sh.getRange(sh.getLastRow()+1, 1, out.length, 4).setValues(out);
+  Logger.log('      ✅ appendTodaySnapshots_: Complete in ' + fmtMs_(Date.now() - funcStart));
 }
 
 // Compact PERF ALERT cache to last N days
 function compactPerfAlertCache_(keepDays) {
+  const funcStart = Date.now();
+  Logger.log('      🔍 compactPerfAlertCache_: Starting (keepDays=' + keepDays + ')...');
   keepDays = keepDays || 35;
   const sh = getPerfAlertCacheSheet_();
   const cutoff = new Date(Date.now() - keepDays*86400000);
   const vals = sh.getDataRange().getValues();
-  if (vals.length <= 1) return;
+  Logger.log('      📊 Cache has ' + (vals.length - 1) + ' rows');
+  if (vals.length <= 1) {
+    Logger.log('      ✅ compactPerfAlertCache_: Nothing to compact');
+    return;
+  }
 
   const keep = [vals[0]];
   for (let i = 1; i < vals.length; i++) {
     const d = vals[i][0] instanceof Date ? vals[i][0] : new Date(vals[i][0]);
     if (d >= cutoff) keep.push(vals[i]);
   }
+  Logger.log('      📊 Keeping ' + (keep.length - 1) + ' rows, removing ' + (vals.length - keep.length) + ' rows');
   sh.clearContents();
   sh.getRange(1,1,keep.length,4).setValues(keep);
+  Logger.log('      ✅ compactPerfAlertCache_: Complete in ' + fmtMs_(Date.now() - funcStart));
 }
 
 // ---------------------
@@ -908,6 +1460,17 @@ function getStaleThresholdDays_() {
   return v;
 }
 
+function isMidFlightDropEnabled_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const networksSheet = ss.getSheetByName("Networks");
+  if (!networksSheet) return false; // Default OFF
+  
+  const raw = String(networksSheet.getRange("I1").getDisplayValue() || "").trim().toUpperCase();
+  const enabled = (raw === "ON" || raw === "TRUE" || raw === "YES" || raw === "ENABLED");
+  Logger.log("Mid-flight drop detection (from Networks!I1): " + (enabled ? "ENABLED" : "DISABLED") + " (raw='" + raw + "')");
+  return enabled;
+}
+
 
 /*******************************************************
  * Low-Priority Scoring — Lightweight (NO sheets/logging)
@@ -1102,8 +1665,9 @@ function runQAOnly() {
     const ignoreSet = loadIgnoreAdvertisers();
     const ownerMap  = loadOwnerMapFromNetworks_();
     const vMap      = loadViolationChangeMap_();
-
-
+    const monitoredNetworks = getMonitoredNetworkIds_();
+    
+    Logger.log("📋 Monitored networks: " + (monitoredNetworks.length > 0 ? monitoredNetworks.join(", ") : "NONE - will process ALL networks"));
 
     compileLPPatternsIfNeeded_();
 
@@ -1133,9 +1697,16 @@ function runQAOnly() {
       const row = data[r];
       const adv  = row[m["Advertiser"]] && String(row[m["Advertiser"]]).trim();
       const camp = row[m["Campaign"]]   || "";
+      const netId = String(row[m["Network ID"]] || "").trim();
+
+      // Filter by monitored networks (if any are specified)
+      if (monitoredNetworks.length > 0 && netId && monitoredNetworks.indexOf(netId) === -1) { 
+        state.next = r + 1; 
+        continue; 
+      }
 
       const advLower = adv ? adv.toLowerCase() : "";
-      if (advLower && (ignoreSet.has(advLower) || advLower.includes("bidmanager"))) { state.next = r + 1; continue; }
+      if (advLower && ignoreSet.has(advLower)) { state.next = r + 1; continue; }
       if (camp && String(camp).includes("DART Search"))                               { state.next = r + 1; continue; }
       if (adv === "Grand Total:")                                                     { state.next = r + 1; continue; }
 
@@ -1268,9 +1839,13 @@ function runQAOnly() {
 
     // Write this chunk's rows
     if (resultsChunk.length) {
+      Logger.log("📝 Writing " + resultsChunk.length + " violations to sheet...");
       const width = resultsChunk[0].length;
       const startWriteRow = out.getLastRow() + 1;
       out.getRange(startWriteRow, 1, resultsChunk.length, width).setValues(resultsChunk);
+      Logger.log("✅ Wrote to rows " + startWriteRow + " to " + (startWriteRow + resultsChunk.length - 1));
+    } else {
+      Logger.log("⚠️ No violations found in this chunk (processed " + processed + " rows)");
     }
 
     // Decide: finished or schedule next chunk
@@ -1316,7 +1891,7 @@ function sendEmailSummary() {
   sendEmailSummaryChunked_(true); // true = allow chunking
 }
 
-function sendEmailSummaryChunked_(allowChunking) {
+function sendEmailSummaryChunked_(allowChunking, skipDateCheck) {
   const startTime = Date.now();
   const isAuto = !isManualRun_();
   
@@ -1339,8 +1914,8 @@ function sendEmailSummaryChunked_(allowChunking) {
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     const today = new Date();
 
-    // Only send on/after the 15th
-    if (today.getDate() < 15) {
+    // Only send on/after the 15th (unless skipDateCheck is true)
+    if (!skipDateCheck && today.getDate() < 15) {
       Logger.log("Email summary skipped: before the 15th of the month.");
       clearEmailState_();
       cancelEmailChunkTrigger_();
@@ -1403,8 +1978,26 @@ function sendEmailSummaryChunked_(allowChunking) {
     if (state.stage === 'grouped_summary') {
       Logger.log('📧 Email Stage 2/4: Building grouped summary...');
       
+      const stage2Start = Date.now();
+      Logger.log('  ⏱️ Building grouped summary HTML...');
       state.cachedHtml.groupedSummary = buildGroupedSummaryHtml_(violations);
+      Logger.log('  ✅ Grouped summary complete (' + fmtMs_(Date.now() - stage2Start) + ')');
+      
+      Logger.log('  ⏱️ Building stale metrics HTML...');
+      const staleStart = Date.now();
       state.cachedHtml.staleHtml = buildStaleHtml_(violations);
+      Logger.log('  ✅ Stale metrics complete (' + fmtMs_(Date.now() - staleStart) + ')');
+      
+      
+      // COMMENTED OUT: Mid-flight drop detection (restore by uncommenting)
+      // Logger.log('  ⏱️ Building mid-flight drop HTML...');
+      // const midFlightStart = Date.now();
+      // state.cachedHtml.midFlightHtml = today.getDate() < 15 ? generateMidFlightDropHtml_() : '';
+      // Logger.log('  ✅ Mid-flight drop complete (' + fmtMs_(Date.now() - midFlightStart) + ')');
+      state.cachedHtml.midFlightHtml = ''; // Disabled
+      
+      Logger.log('📊 Stage 2 total time: ' + fmtMs_(Date.now() - stage2Start));
+      
       state.stage = 'immediate_attention';
       saveEmailState_(state);
       
@@ -1417,11 +2010,16 @@ function sendEmailSummaryChunked_(allowChunking) {
 
     // === STAGE 3: Immediate Attention (chunked by owner) ===
     if (state.stage === 'immediate_attention') {
+      Logger.log('📧 Email Stage 3/4: Building immediate attention section...');
+      const stage3Start = Date.now();
       if (!state.cachedHtml.immediateAttention) state.cachedHtml.immediateAttention = '';
       
       // Build owner list if first time
       if (state.allOwners.length === 0) {
+        Logger.log('  ⏱️ Analyzing violations for immediate attention (' + (violations.length - 1) + ' rows)...');
+        const ownerDataStart = Date.now();
         const ownerData = buildImmediateAttentionData_(violations);
+        Logger.log('  ✅ Owner data built: ' + ownerData.owners.length + ' owners in ' + fmtMs_(Date.now() - ownerDataStart));
         state.allOwners = ownerData.owners;
         state.ownerMap = ownerData.perOwner;
         state.processedOwners = [];
@@ -1434,9 +2032,11 @@ function sendEmailSummaryChunked_(allowChunking) {
         const chunkSize = allowChunking ? MAX_OWNERS_PER_CHUNK : remainingOwners.length;
         const ownersThisChunk = remainingOwners.slice(0, chunkSize);
         
-        Logger.log('📧 Email Stage 3/4: Processing ' + ownersThisChunk.length + ' owners (' + remainingOwners.length + ' remaining)...');
+        Logger.log('  ⏱️ Processing ' + ownersThisChunk.length + ' owners (' + remainingOwners.length + ' remaining)...');
+        const ownerHtmlStart = Date.now();
         
         const htmlChunk = buildImmediateAttentionHtmlForOwners_(ownersThisChunk, state.ownerMap);
+        Logger.log('  ✅ Owner HTML generated in ' + fmtMs_(Date.now() - ownerHtmlStart));
         state.cachedHtml.immediateAttention += htmlChunk;
         state.processedOwners = state.processedOwners.concat(ownersThisChunk);
         saveEmailState_(state);
@@ -1511,17 +2111,43 @@ function sendEmailSummaryChunked_(allowChunking) {
         return;
       }
 
-      // Generate mid-flight drop HTML
-      const midFlightHtml = generateMidFlightDropHtml_();
-
       // Assemble email
       const subject = "CM360 CPC/CPM FLIGHT QA – " + Utilities.formatDate(today, Session.getScriptTimeZone(), "M/d/yy");
       let htmlBody = state.cachedHtml.networkSummary +
                      '<p>The below is a table of the following Billing, Delivery, Performance and Cost issues:</p>' +
                      state.cachedHtml.groupedSummary +
                      (state.cachedHtml.immediateAttention ? ('<br/>' + state.cachedHtml.immediateAttention) : '') +
-                     (midFlightHtml ? ('<br/>' + midFlightHtml) : '') +
+                     (state.cachedHtml.midFlightHtml ? ('<br/>' + state.cachedHtml.midFlightHtml) : '') +
                      '<br/>' + state.cachedHtml.staleHtml +
+                     '<hr/>' +
+                     '<h3>📧 How to Mark Placements as Handled:</h3>' +
+                     '<p>Reply to this email with the following format:</p>' +
+                     '<pre style="background: #f5f5f5; padding: 10px;">' +
+                     'Your note describing what was done\n' +
+                     '12345678\n' +
+                     '87654321\n' +
+                     '98765432' +
+                     '</pre>' +
+                     '<p>Handled placements will appear at the bottom of your section in future reports with a green checkmark.</p>' +
+                     '<hr/>' +
+                     '<h3>📧 To Remove a Network from Monitoring:</h3>' +
+                     '<p>Reply to this email with "REMOVE NETWORK [ID]" in the body.</p>' +
+                     '<p><b>Example (for multiple networks):</b></p>' +
+                     '<pre style="background: #f5f5f5; padding: 10px;">' +
+                     'REMOVE NETWORK 12345\n' +
+                     'REMOVE NETWORK 67890\n' +
+                     'REMOVE NETWORK 99999' +
+                     '</pre>' +
+                     '<hr/>' +
+                     '<h3>📋 How to Add a New Network Report:</h3>' +
+                     '<ol>' +
+                     '<li><b>Step 1:</b> Place this exact string into the AI helper in DCM Reports:<br/>' +
+                     '<code>Advertiser, Placement ID, Placement, Campaign, Placement Start Date, Placement End Date, Campaign Start Date, Campaign End Date, Ad, Impressions, Clicks, This Month</code></li>' +
+                     '<li><b>Step 2:</b> Set the report subject/label to exactly: <code>BKCM360 Global QA Check</code></li>' +
+                     '<li><b>Step 3:</b> Set schedule with end date of Jan 1, 2030</li>' +
+                     '<li><b>Step 4:</b> Ensure you CC this email exactly: <code>platformsolutionsadopshorizon@gmail.com</code></li>' +
+                     '</ol>' +
+                     '<hr/>' +
                      '<p><i>Brought to you by the Platform Solutions Automation. (Made by: BK)</i></p>';
 
       // Safety trim
@@ -1616,6 +2242,24 @@ function buildNetworkSummaryHtml_(violations, rawData, networksSheet) {
     return map;
   }
   const networkNameMap = buildNetworkNameMap_();
+  
+  // Get all monitored networks
+  const monitoredSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Monitored Networks");
+  const allMonitoredNetworks = [];
+  if (monitoredSheet) {
+    const monitoredData = monitoredSheet.getDataRange().getValues();
+    for (let i = 1; i < monitoredData.length; i++) {
+      const id = String(monitoredData[i][0] || "").trim();
+      const name = String(monitoredData[i][1] || "").trim();
+      if (id) {
+        allMonitoredNetworks.push({ id: id, name: name || "TO BE ADDED" });
+        // Ensure it's in the name map
+        if (!networkNameMap[id]) {
+          networkNameMap[id] = name || "TO BE ADDED";
+        }
+      }
+    }
+  }
 
   const placementCounts = {};
   rawData.slice(1).forEach(function(r){
@@ -1645,12 +2289,17 @@ function buildNetworkSummaryHtml_(violations, rawData, networksSheet) {
     + '<th>🟥 BILLING</th><th>🟦 DELIVERY</th><th>🟨 PERFORMANCE</th><th>🟩 COST</th>'
     + '</tr>';
 
+  // Show all monitored networks (even with 0 placements)
+  const monitoredIds = allMonitoredNetworks.map(function(n){ return n.id; });
+  
   Object.entries(networkNameMap)
     .filter(function(pair){
       const id = pair[0];
+      // Show if monitored (even with 0) OR has violations
+      const isMonitored = monitoredIds.indexOf(id) !== -1;
       const vc = violationCounts[id] || { "🟥 BILLING":0,"🟦 DELIVERY":0,"🟨 PERFORMANCE":0,"🟩 COST":0 };
       const total = vc["🟥 BILLING"] + vc["🟦 DELIVERY"] + vc["🟨 PERFORMANCE"] + vc["🟩 COST"];
-      return total > 0;
+      return isMonitored || total > 0;
     })
     .sort(function(a, b){ return a[1].localeCompare(b[1]); })
     .forEach(function(entry){
@@ -1672,7 +2321,12 @@ function buildGroupedSummaryHtml_(violations) {
   const groupedCounts = { "🟥 BILLING": {}, "🟦 DELIVERY": {}, "🟨 PERFORMANCE": {}, "🟩 COST": {} };
   
   violations.slice(1).forEach(function(r){
-    const types = String(r[hMap["Issue Type"]] || "").split(", ");
+    const issueTypeStr = String(r[hMap["Issue Type"]] || "");
+    
+    // Skip rows with Low Priority issues
+    if (/\(Low Priority\)/i.test(issueTypeStr)) return;
+    
+    const types = issueTypeStr.split(", ");
     types.forEach(function(t){
       const match = t.match(/^(🟥|🟦|🟨|🟩)\s(\w+):\s(.+)/);
       if (match) {
@@ -1699,6 +2353,8 @@ function buildGroupedSummaryHtml_(violations) {
 }
 
 function buildStaleHtml_(violations) {
+  const funcStart = Date.now();
+  Logger.log('    🔍 buildStaleHtml_: Processing ' + (violations.length - 1) + ' violations...');
   const thresholdDays = getStaleThresholdDays_();
   let staleImp = 0, staleClk = 0;
   const hMap = getHeaderMap(violations[0]);
@@ -1713,6 +2369,7 @@ function buildStaleHtml_(violations) {
       if (isFinite(clkDays) && clkDays >= thresholdDays) staleClk++;
     }
   }
+  Logger.log('    ✅ buildStaleHtml_: Complete in ' + fmtMs_(Date.now() - funcStart) + ' (staleImp=' + staleImp + ', staleClk=' + staleClk + ')');
   
   return "<b>Stale Metrics (this month)</b><ul>"
     + "<li>Placements with no new impressions since last change (≥ " + thresholdDays + " days): " + staleImp + "</li>"
@@ -1721,7 +2378,10 @@ function buildStaleHtml_(violations) {
 }
 
 function buildImmediateAttentionData_(violations) {
+  const funcStart = Date.now();
+  Logger.log('    🔍 buildImmediateAttentionData_: Starting with ' + (violations.length - 1) + ' violations...');
   const ownerMap = loadOwnerMapFromNetworks_();
+  Logger.log('    📋 Loaded owner map with ' + Object.keys(ownerMap).length + ' entries');
   const hMap = getHeaderMap(violations[0]);
   const perOwner = {};
   
@@ -1780,10 +2440,12 @@ function buildImmediateAttentionData_(violations) {
     return null;
   }
 
+  let qualified = 0;
   for (let i = 1; i < violations.length; i++) {
     const row = violations[i];
     const q = qualifies_(row);
     if (!q) continue;
+    qualified++;
 
     const netId = String(row[idx.netId] || "").trim();
     const adv = String(row[idx.adv] || "").trim();
@@ -1796,16 +2458,44 @@ function buildImmediateAttentionData_(violations) {
       imp: Number(row[idx.impr] || 0), clk: Number(row[idx.clk] || 0),
       issue: String(row[idx.issues] || "")
     });
+    
+    if (i % 100 === 0) {
+      Logger.log('    ⏱️ Processed ' + i + '/' + (violations.length - 1) + ' rows...');
+    }
   }
 
   const owners = Object.keys(perOwner).sort(function(a,b){ return a.toLowerCase().localeCompare(b.toLowerCase()); });
+  Logger.log('    ✅ buildImmediateAttentionData_: Complete in ' + fmtMs_(Date.now() - funcStart) + ' (' + qualified + ' qualified, ' + owners.length + ' owners)');
   
   return { owners: owners, perOwner: perOwner };
 }
 
 function buildImmediateAttentionHtmlForOwners_(owners, perOwner) {
+  const funcStart = Date.now();
+  Logger.log('    🔍 buildImmediateAttentionHtmlForOwners_: Processing ' + owners.length + ' owners...');
   const MAX_ROWS_PER_OWNER = 30;
   const MAX_TOTAL_OWNER_ROWS = 1000;
+  
+  // Get handled placements
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const handledSheet = ss.getSheetByName("Handled Placements");
+  const handledMap = {};
+  
+  if (handledSheet) {
+    const handledData = handledSheet.getDataRange().getValues();
+    const hHeaders = handledData[0];
+    
+    for (let i = 1; i < handledData.length; i++) {
+      const row = handledData[i];
+      const pid = String(row[hHeaders.indexOf("Placement ID")] || "").trim();
+      if (pid) {
+        handledMap[pid] = {
+          note: String(row[hHeaders.indexOf("Note")] || ""),
+          date: String(row[hHeaders.indexOf("Note-Date Last Updated")] || "")
+        };
+      }
+    }
+  }
   
   let html = '';
   let totalRows = 0;
@@ -1823,19 +2513,39 @@ function buildImmediateAttentionHtmlForOwners_(owners, perOwner) {
       if (b.imp !== a.imp) return b.imp - a.imp;
       return a.pid.localeCompare(b.pid);
     });
+    
+    // Separate handled vs unhandled
+    const unhandled = [];
+    const handled = [];
+    
+    arr.forEach(function(item) {
+      if (handledMap[item.pid]) {
+        handled.push({
+          item: item,
+          note: handledMap[item.pid].note,
+          date: handledMap[item.pid].date
+        });
+      } else {
+        unhandled.push(item);
+      }
+    });
 
-    const take = Math.min(arr.length, MAX_ROWS_PER_OWNER, MAX_TOTAL_OWNER_ROWS - totalRows);
-    if (take <= 0) break;
-    totalRows += take;
+    const takeUnhandled = Math.min(unhandled.length, MAX_ROWS_PER_OWNER, MAX_TOTAL_OWNER_ROWS - totalRows);
+    const takeHandled = Math.min(handled.length, Math.max(0, MAX_TOTAL_OWNER_ROWS - totalRows - takeUnhandled));
+    
+    const totalShowing = takeUnhandled + takeHandled;
+    if (totalShowing <= 0) break;
+    totalRows += totalShowing;
 
-    html += "<p><b>" + rep + "</b> (Showing " + take + " of " + arr.length + ")</p>";
+    html += "<p><b>" + rep + "</b> (Showing " + totalShowing + " of " + arr.length + ")</p>";
     html += '<table border="1" cellpadding="4" cellspacing="0" style="border-collapse: collapse; font-size: 11px;">'
          +  '<tr style="background-color:#f9f9f9;font-weight:bold;">'
-         +  '<th>Advertiser</th><th>Campaign</th><th>Placement ID</th><th>Placement</th><th>Impr</th><th>Clicks</th><th>Issue(s)</th>'
+         +  '<th>Advertiser</th><th>Campaign</th><th>Placement ID</th><th>Placement</th><th>Impr</th><th>Clicks</th><th>Issue(s)</th><th>Status</th>'
          +  '</tr>';
 
-    for (let j = 0; j < take; j++) {
-      const o = arr[j];
+    // Show unhandled first
+    for (let j = 0; j < takeUnhandled; j++) {
+      const o = unhandled[j];
       const campShort = o.camp.length > 40 ? o.camp.substring(0, 40) + "…" : o.camp;
       const plcShort = o.plc.length > 30 ? o.plc.substring(0, 30) + "…" : o.plc;
       html += "<tr>"
@@ -1846,10 +2556,36 @@ function buildImmediateAttentionHtmlForOwners_(owners, perOwner) {
            +  "<td>" + o.imp + "</td>"
            +  "<td>" + o.clk + "</td>"
            +  "<td>" + o.issue + "</td>"
+           +  "<td></td>"
            +  "</tr>";
     }
+    
+    // Show handled at bottom with note
+    for (let j = 0; j < takeHandled; j++) {
+      const h = handled[j];
+      const o = h.item;
+      const campShort = o.camp.length > 40 ? o.camp.substring(0, 40) + "…" : o.camp;
+      const plcShort = o.plc.length > 30 ? o.plc.substring(0, 30) + "…" : o.plc;
+      html += '<tr style="background-color:#e8f5e9;">'
+           +  "<td>" + o.adv + "</td>"
+           +  "<td>" + campShort + "</td>"
+           +  "<td>" + o.pid + "</td>"
+           +  "<td>" + plcShort + "</td>"
+           +  "<td>" + o.imp + "</td>"
+           +  "<td>" + o.clk + "</td>"
+           +  "<td>" + o.issue + "</td>"
+           +  '<td style="font-style:italic;">✓ ' + h.note + '</td>'
+           +  "</tr>";
+    }
+    
     html += "</table><br/>";
+    
+    if ((i + 1) % 5 === 0) {
+      Logger.log('    ⏱️ Processed ' + (i + 1) + '/' + owners.length + ' owners...');
+    }
   }
+  
+  Logger.log('    ✅ buildImmediateAttentionHtmlForOwners_: Complete in ' + fmtMs_(Date.now() - funcStart) + ' (totalRows=' + totalRows + ')');
 
   return html;
 }
@@ -2174,12 +2910,27 @@ function detectMidFlightDrop_(key, currentImp, currentClk, threshold) {
 }
 
 function generateMidFlightDropHtml_() {
+  const funcStart = Date.now();
+  Logger.log('    🔍 generateMidFlightDropHtml_: Starting...');
+  
+  // Check if mid-flight drop detection is enabled
+  if (!isMidFlightDropEnabled_()) {
+    Logger.log('    ⚠️ generateMidFlightDropHtml_: DISABLED (set Networks!I1 to "ON" to enable)');
+    return "";
+  }
+  
   const today = new Date();
   const ss = SpreadsheetApp.getActiveSpreadsheet();
+  
   const rawSheet = ss.getSheetByName("Raw Data");
-  if (!rawSheet) return "";
+  if (!rawSheet) {
+    Logger.log('    ⚠️ generateMidFlightDropHtml_: No Raw Data sheet');
+    return "";
+  }
 
+  Logger.log('    📊 Reading Raw Data sheet...');
   const values = rawSheet.getDataRange().getValues();
+  Logger.log('    📊 Raw Data has ' + (values.length - 1) + ' rows');
   if (values.length <= 1) return "";
 
   const headers = values[0];
@@ -2190,9 +2941,14 @@ function generateMidFlightDropHtml_() {
     "Network ID", "Advertiser", "Placement ID", "Placement", "Campaign",
     "Placement Start Date", "Placement End Date", "Impressions", "Clicks"
   ];
-  if (req.some(function(k){ return hMap[k] === undefined; })) return "";
+  if (req.some(function(k){ return hMap[k] === undefined; })) {
+    Logger.log('    ⚠️ generateMidFlightDropHtml_: Missing required columns');
+    return "";
+  }
 
+  Logger.log('    ⏱️ Getting drop threshold...');
   const threshold = getDropThreshold_();
+  Logger.log('    📊 Drop threshold: ' + threshold + '%');
   const snapshots = [];
   const dropAlerts = [];
 
@@ -2200,7 +2956,15 @@ function generateMidFlightDropHtml_() {
   const CPC_RATE = 0.008;  // $8 per 1000 clicks
   const CPM_RATE = 0.034;  // $0.034 per 1000 impressions
 
+  Logger.log('    ⏱️ Processing rows for mid-flight drops...');
+  let processedRows = 0;
+  let checkedRows = 0;
   values.slice(1).forEach(function(r){
+    processedRows++;
+    if (processedRows % 1000 === 0) {
+      Logger.log('    ⏱️ Processed ' + processedRows + '/' + (values.length - 1) + ' rows (found ' + checkedRows + ' mid-flight)...');
+    }
+    
     const netId = String(r[hMap["Network ID"]] || "");
     const adv   = String(r[hMap["Advertiser"]] || "");
     const camp  = String(r[hMap["Campaign"]] || "");
@@ -2225,6 +2989,8 @@ function generateMidFlightDropHtml_() {
     
     // Filter: Must have CPM >= $10 OR CPC >= $10
     if (cpc < 10 && cpm < 10) return;
+    
+    checkedRows++;
 
     const key = pid ? ('pid:' + pid) : ('k:' + netId + '|' + camp + '|' + plc);
     snapshots.push({ key: key, imp: imp, clk: clk });
@@ -2256,11 +3022,18 @@ function generateMidFlightDropHtml_() {
     }
   });
 
+  Logger.log('    ⏱️ Appending ' + snapshots.length + ' snapshots...');
   appendTodaySnapshots_(snapshots);
+  Logger.log('    ⏱️ Compacting performance alert cache...');
   compactPerfAlertCache_(35);
+  Logger.log('    ✅ Found ' + dropAlerts.length + ' drop alerts');
 
-  if (!dropAlerts.length) return "";
+  if (!dropAlerts.length) {
+    Logger.log('    ✅ generateMidFlightDropHtml_: Complete in ' + fmtMs_(Date.now() - funcStart) + ' (no alerts)');
+    return "";
+  }
 
+  Logger.log('    ⏱️ Building HTML for ' + dropAlerts.length + ' alerts...');
   const htmlRows = dropAlerts.map(function(o){
     return (
       '<tr>' +
@@ -2296,6 +3069,9 @@ function generateMidFlightDropHtml_() {
     + '</tr>'
     + htmlRows
     + '</table><br/>';
+  
+  Logger.log('    ✅ generateMidFlightDropHtml_: Complete in ' + fmtMs_(Date.now() - funcStart));
+  return html;
 }
 
 function sendMidFlightDropAlert() {
@@ -2368,7 +3144,7 @@ function runQAOnlyImmediate() {
     return;
   }
 
-  clearViolations();
+  // Don't clear violations here - runQAOnly() will do it when it detects freshStart
   
   Logger.log('Processing ' + (data.length - 1) + ' rows immediately...');
   
@@ -2386,19 +3162,38 @@ function runQAOnlyImmediate() {
 
 function sendEmailSummaryImmediate() {
   const startTime = Date.now();
-  Logger.log('🏃 sendEmailSummaryImmediate - Manual immediate mode (no chunking)');
+  Logger.log('🏃 sendEmailSummaryImmediate - Manual mode (will auto-chunk if needed)');
   
   // Clear any existing state
   clearEmailState_();
   cancelEmailChunkTrigger_();
   
-  // Call the chunked version but tell it not to chunk
+  // Call the chunked version - it will auto-chunk if it runs out of time
   try {
-    sendEmailSummaryChunked_(false);
+    sendEmailSummaryChunked_(true); // Changed to true to allow chunking if needed
     const duration = Date.now() - startTime;
     Logger.log('✅ sendEmailSummaryImmediate completed in ' + fmtMs_(duration));
   } catch (e) {
     Logger.log('❌ sendEmailSummaryImmediate failed: ' + e.message);
+    throw e;
+  }
+}
+
+function sendEmailNow() {
+  const startTime = Date.now();
+  Logger.log('🏃 sendEmailNow - FORCE SEND (bypasses date check)');
+  
+  // Clear any existing state
+  clearEmailState_();
+  cancelEmailChunkTrigger_();
+  
+  // Call the chunked version with date check disabled
+  try {
+    sendEmailSummaryChunked_(true, true); // true, true = allow chunking, skip date check
+    const duration = Date.now() - startTime;
+    Logger.log('✅ sendEmailNow completed in ' + fmtMs_(duration));
+  } catch (e) {
+    Logger.log('❌ sendEmailNow failed: ' + e.message);
     throw e;
   }
 }
@@ -2532,4 +3327,245 @@ function trimAllSheetsToData_() {
       sh.deleteColumns(targetCols + 1, maxCols - targetCols);
     }
   });
+}
+
+/**
+ * 🔍 DEBUG: Check what's being filtered out in QA logic
+ * Run this to see why no violations are being detected
+ */
+function debugQAFiltering() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const rawSheet = ss.getSheetByName("Raw Data");
+  const ignoreSheet = ss.getSheetByName("Advertisers to ignore");
+  
+  if (!rawSheet) {
+    Logger.log("❌ No Raw Data sheet found");
+    return;
+  }
+  
+  // Get ignored advertisers list
+  let ignoredAdvs = [];
+  if (ignoreSheet) {
+    const ignoreData = ignoreSheet.getDataRange().getValues();
+    ignoredAdvs = ignoreData.slice(1).map(row => String(row[0] || "").trim().toUpperCase()).filter(x => x);
+    Logger.log("📋 Ignored advertisers: " + ignoredAdvs.length + " total");
+    Logger.log("   First 10: " + ignoredAdvs.slice(0, 10).join(", "));
+  } else {
+    Logger.log("⚠️ No 'Advertisers to ignore' sheet found");
+  }
+  
+  const values = rawSheet.getDataRange().getValues();
+  Logger.log("📊 Total raw rows: " + (values.length - 1));
+  
+  const headers = values[0];
+  const hMap = {};
+  headers.forEach((h, i) => { hMap[h] = i; });
+  
+  Logger.log("📋 Headers: " + headers.join(", "));
+  
+  const counters = {
+    total: 0,
+    ignored_advertiser: 0,
+    dart_search: 0,
+    grand_total: 0,
+    zero_metrics: 0,
+    passed_filters: 0
+  };
+  
+  // Test first 100 rows
+  const testRows = values.slice(1, Math.min(101, values.length));
+  Logger.log("\n🧪 Testing first " + testRows.length + " rows:");
+  
+  testRows.forEach((r, idx) => {
+    counters.total++;
+    const adv = String(r[hMap["Advertiser"]] || "");
+    const camp = String(r[hMap["Campaign"]] || "");
+    const imp = Number(r[hMap["Impressions"]] || 0);
+    const clk = Number(r[hMap["Clicks"]] || 0);
+    
+    // Check filters
+    const advUpper = adv.toUpperCase();
+    
+    if (ignoredAdvs.some(ig => advUpper.includes(ig))) {
+      counters.ignored_advertiser++;
+      if (idx < 5) Logger.log(`   Row ${idx + 2}: ❌ Ignored advertiser: "${adv}"`);
+      return;
+    }
+    
+    if (advUpper.includes("DART SEARCH") || camp.toUpperCase().includes("DART SEARCH")) {
+      counters.dart_search++;
+      if (idx < 5) Logger.log(`   Row ${idx + 2}: ❌ DART Search: "${adv}" / "${camp}"`);
+      return;
+    }
+    
+    if (camp.toUpperCase().includes("GRAND TOTAL")) {
+      counters.grand_total++;
+      if (idx < 5) Logger.log(`   Row ${idx + 2}: ❌ Grand Total: "${camp}"`);
+      return;
+    }
+    
+    if (imp === 0 && clk === 0) {
+      counters.zero_metrics++;
+      if (idx < 5) Logger.log(`   Row ${idx + 2}: ❌ Zero metrics`);
+      return;
+    }
+    
+    counters.passed_filters++;
+    if (idx < 5) {
+      Logger.log(`   Row ${idx + 2}: ✅ Passed - Adv: "${adv}", Imp: ${imp}, Clk: ${clk}`);
+    }
+  });
+  
+  Logger.log("\n📊 FILTERING RESULTS (first 100 rows):");
+  Logger.log("   Total: " + counters.total);
+  Logger.log("   ❌ Ignored advertiser: " + counters.ignored_advertiser);
+  Logger.log("   ❌ DART Search: " + counters.dart_search);
+  Logger.log("   ❌ Grand Total: " + counters.grand_total);
+  Logger.log("   ❌ Zero metrics: " + counters.zero_metrics);
+  Logger.log("   ✅ Passed filters: " + counters.passed_filters);
+  
+  const passRate = (counters.passed_filters / counters.total * 100).toFixed(1);
+  Logger.log("\n📈 Pass rate: " + passRate + "%");
+  
+  if (counters.passed_filters === 0) {
+    Logger.log("\n🚨 CRITICAL: NO ROWS PASSED FILTERS!");
+    Logger.log("   Check 'Advertisers to ignore' sheet - might be over-filtering");
+  }
+}
+
+/**
+ * 🔍 DEBUG: Count rows with non-zero metrics
+ */
+function countNonZeroRows() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const rawSheet = ss.getSheetByName("Raw Data");
+  
+  if (!rawSheet) {
+    Logger.log("❌ No Raw Data sheet found");
+    return;
+  }
+  
+  const values = rawSheet.getDataRange().getValues();
+  const headers = values[0];
+  const hMap = {};
+  headers.forEach((h, i) => { hMap[h] = i; });
+  
+  let nonZeroCount = 0;
+  let totalRows = values.length - 1;
+  
+  values.slice(1).forEach(r => {
+    const imp = Number(r[hMap["Impressions"]] || 0);
+    const clk = Number(r[hMap["Clicks"]] || 0);
+    
+    if (imp > 0 || clk > 0) {
+      nonZeroCount++;
+    }
+  });
+  
+  Logger.log("📊 Total raw rows: " + totalRows);
+  Logger.log("✅ Rows with impressions > 0 OR clicks > 0: " + nonZeroCount);
+  Logger.log("📈 Percentage: " + (nonZeroCount / totalRows * 100).toFixed(1) + "%");
+  
+  if (nonZeroCount === 0) {
+    Logger.log("🚨 CRITICAL: ALL ROWS HAVE ZERO METRICS!");
+  }
+}
+
+/**
+ * 🔍 DEBUG: Run QA on first 100 rows with detailed logging
+ */
+function debugQALogic() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const rawSheet = ss.getSheetByName("Raw Data");
+  const ignoreSheet = ss.getSheetByName("Advertisers to ignore");
+  
+  if (!rawSheet) {
+    Logger.log("❌ No Raw Data sheet found");
+    return;
+  }
+  
+  const values = rawSheet.getDataRange().getValues();
+  const headers = values[0];
+  const hMap = {};
+  headers.forEach((h, i) => { hMap[h] = i; });
+  
+  // Get ignored advertisers
+  let ignoredAdvs = [];
+  if (ignoreSheet) {
+    const ignoreData = ignoreSheet.getDataRange().getValues();
+    ignoredAdvs = ignoreData.slice(1).map(row => String(row[0] || "").trim().toUpperCase()).filter(x => x);
+  }
+  
+  Logger.log("🧪 Testing QA logic on first 100 rows...\n");
+  
+  const testRows = values.slice(1, Math.min(101, values.length));
+  let violationCount = 0;
+  
+  testRows.forEach((row, idx) => {
+    const adv = String(row[hMap["Advertiser"]] || "");
+    const camp = String(row[hMap["Campaign"]] || "");
+    const imp = Number(row[hMap["Impressions"]] || 0);
+    const clk = Number(row[hMap["Clicks"]] || 0);
+    const rd = row[hMap["Report Date"]];
+    const ps = row[hMap["Placement Start Date"]];
+    const pe = row[hMap["Placement End Date"]];
+    
+    // Check filters
+    const advUpper = adv.toUpperCase();
+    if (ignoredAdvs.some(ig => advUpper.includes(ig))) return;
+    if (advUpper.includes("DART SEARCH") || camp.toUpperCase().includes("DART SEARCH")) return;
+    if (camp.toUpperCase().includes("GRAND TOTAL")) return;
+    if (imp === 0 && clk === 0) return;
+    
+    // Calculate metrics
+    const ctr = (imp > 0) ? (clk / imp * 100) : 0;
+    const cpc = (clk > 0) ? (clk * 0.008) : 0;
+    const cpm = (imp > 0) ? (imp * 0.034) : 0;
+    
+    let violations = [];
+    
+    // Check for CTR violation
+    if (ctr >= 90 && cpm >= 10) {
+      violations.push("CTR=" + ctr.toFixed(2) + "%, CPM=$" + cpm.toFixed(2));
+    }
+    
+    // Check for CPC violation
+    if (cpc > 0 && cpm === 0 && cpc > 10) {
+      violations.push("CPC-only=$" + cpc.toFixed(2));
+    }
+    
+    // Check for CPM violation
+    if (cpm > 0 && cpc === 0 && cpm > 10) {
+      violations.push("CPM-only=$" + cpm.toFixed(2));
+    }
+    
+    // Check for clicks > impressions
+    if (cpc > 0 && cpm > 0 && clk > imp && cpc > 10) {
+      violations.push("Clicks>Impr CPC=$" + cpc.toFixed(2));
+    }
+    
+    if (violations.length > 0) {
+      violationCount++;
+      if (violationCount <= 10) {
+        Logger.log("Row " + (idx + 2) + ": 🚨 VIOLATION");
+        Logger.log("   Adv: " + adv.substring(0, 50));
+        Logger.log("   Imp: " + imp + ", Clk: " + clk);
+        Logger.log("   CTR: " + ctr.toFixed(2) + "%, CPC: $" + cpc.toFixed(2) + ", CPM: $" + cpm.toFixed(2));
+        Logger.log("   Issues: " + violations.join(", "));
+        Logger.log("");
+      }
+    }
+  });
+  
+  Logger.log("📊 RESULTS:");
+  Logger.log("   Rows tested: " + testRows.length);
+  Logger.log("   Violations found: " + violationCount);
+  Logger.log("   Violation rate: " + (violationCount / testRows.length * 100).toFixed(1) + "%");
+  
+  if (violationCount === 0) {
+    Logger.log("\n🤔 NO VIOLATIONS FOUND - checking thresholds:");
+    Logger.log("   CTR threshold: >= 90% AND CPM >= $10");
+    Logger.log("   CPC threshold: > $10 (CPC-only)");
+    Logger.log("   CPM threshold: > $10 (CPM-only)");
+  }
 }
