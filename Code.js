@@ -3568,4 +3568,4 @@ function debugQALogic() {
     Logger.log("   CPC threshold: > $10 (CPC-only)");
     Logger.log("   CPM threshold: > $10 (CPM-only)");
   }
-}
+
