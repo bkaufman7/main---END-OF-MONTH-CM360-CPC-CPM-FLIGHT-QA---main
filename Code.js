@@ -1706,7 +1706,7 @@ function runQAOnly() {
       }
 
       const advLower = adv ? adv.toLowerCase() : "";
-      if (advLower && ignoreSet.has(advLower)) { state.next = r + 1; continue; }
+      if (advLower && (ignoreSet.has(advLower) || advLower.includes("bidmanager"))) { state.next = r + 1; continue; }
       if (camp && String(camp).includes("DART Search"))                               { state.next = r + 1; continue; }
       if (adv === "Grand Total:")                                                     { state.next = r + 1; continue; }
 
