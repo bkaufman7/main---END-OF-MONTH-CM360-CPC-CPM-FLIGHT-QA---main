@@ -3557,15 +3557,15 @@ function debugQALogic() {
     }
   });
   
-  Logger.log("📊 RESULTS:");
+  Logger.log("[RESULTS]");
   Logger.log("   Rows tested: " + testRows.length);
   Logger.log("   Violations found: " + violationCount);
   Logger.log("   Violation rate: " + (violationCount / testRows.length * 100).toFixed(1) + "%");
   
   if (violationCount === 0) {
-    Logger.log("\n🤔 NO VIOLATIONS FOUND - checking thresholds:");
+    Logger.log("\nNO VIOLATIONS FOUND - checking thresholds:");
     Logger.log("   CTR threshold: >= 90% AND CPM >= $10");
     Logger.log("   CPC threshold: > $10 (CPC-only)");
     Logger.log("   CPM threshold: > $10 (CPM-only)");
   }
-
+}
