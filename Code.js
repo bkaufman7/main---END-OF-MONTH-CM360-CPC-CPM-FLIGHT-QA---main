@@ -34,6 +34,9 @@ function onOpen() {
     .addItem("Process Email Replies (Manual)", "processEmailReplies")
     .addItem("Clear Handled Placements", "clearHandledPlacements")
     .addSeparator()
+    .addItem("Process Network Removal Requests", "processNetworkRemovalRequests")
+    .addItem("Backfill Source Email Links", "backfillSourceEmailLinks")
+    .addSeparator()
     .addItem("Clear Violations", "clearViolations")
     .addToUi();
 }
@@ -561,8 +564,285 @@ function processCSV(fileContent, networkId) {
   return csvData.map(function(row){ return [networkId].concat(row).concat([reportDate]); });
 }
 
+// =====================
+// REMOVED NETWORKS FEATURE
+// =====================
+
+/**
+ * Gets the set of removed network IDs from the Removed Networks sheet
+ * @param {SpreadsheetApp.Spreadsheet} ss - The active spreadsheet
+ * @returns {Set<string>} Set of removed network IDs
+ */
+function getRemovedNetworks(ss) {
+  const removedSheet = ss.getSheetByName("Removed Networks");
+  const removedNetworks = new Set();
+  
+  if (removedSheet && removedSheet.getLastRow() > 1) {
+    const data = removedSheet.getRange(2, 1, removedSheet.getLastRow() - 1, 1).getValues();
+    data.forEach(function(row) {
+      if (row[0]) removedNetworks.add(String(row[0]).trim());
+    });
+  }
+  
+  return removedNetworks;
+}
+
+/**
+ * Ensures the Removed Networks audit sheet exists
+ * @param {SpreadsheetApp.Spreadsheet} ss - The active spreadsheet
+ * @returns {SpreadsheetApp.Sheet} The Removed Networks sheet
+ */
+function ensureRemovedNetworksSheet(ss) {
+  try {
+    let removedSheet = ss.getSheetByName("Removed Networks");
+    
+    if (!removedSheet) {
+      removedSheet = ss.insertSheet("Removed Networks");
+      const headers = ["Network ID", "Network Name", "Removed By", "Date Removed", "Source Email"];
+      removedSheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+      removedSheet.getRange(1, 1, 1, headers.length).setFontWeight("bold");
+      Logger.log("Created Removed Networks sheet");
+    }
+    
+    return removedSheet;
+  } catch (error) {
+    Logger.log("Failed to create Removed Networks sheet: " + error);
+    throw error;
+  }
+}
+
+/**
+ * Processes network removal requests from email replies
+ * Looks for "REMOVE NETWORK [ID]" commands in replies to QA emails
+ * @returns {Array<Object>} Array of successfully removed networks
+ */
+function processNetworkRemovalRequests() {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const networksSheet = ss.getSheetByName("Networks");
+    const removedSheet = ensureRemovedNetworksSheet(ss);
+    
+    if (!networksSheet) {
+      Logger.log("Networks sheet not found");
+      return [];
+    }
+    
+    const today = new Date();
+    const yesterday = new Date(today.getTime() - 24 * 60 * 60 * 1000);
+    const formattedYesterday = Utilities.formatDate(yesterday, Session.getScriptTimeZone(), "yyyy/MM/dd");
+    
+    // Search for replies to QA Report emails
+    const threads = GmailApp.search('subject:"CM360 CPC/CPM FLIGHT QA" after:' + formattedYesterday);
+    const removalCommands = [];
+    const regex = /REMOVE\s+NETWORK\s+(\d+)/gi;
+    const exampleNetworkIds = new Set(["12345", "67890", "99999"]); // Skip example IDs from email instructions
+  
+    threads.forEach(function(thread) {
+      thread.getMessages().forEach(function(message) {
+        const body = message.getPlainBody();
+        const from = message.getFrom();
+        const messageId = message.getId();
+        let match;
+        
+        while ((match = regex.exec(body)) !== null) {
+          const networkId = match[1];
+          
+          // Skip example network IDs used in email instructions
+          if (exampleNetworkIds.has(networkId)) {
+            Logger.log("Skipping example network ID: " + networkId);
+            continue;
+          }
+          
+          removalCommands.push({
+            networkId: networkId,
+            from: from,
+            date: message.getDate(),
+            messageId: messageId
+          });
+        }
+      });
+    });
+  
+    if (removalCommands.length === 0) {
+      Logger.log("No removal requests found.");
+      return [];
+    }
+    
+    // Deduplicate by network ID (keep latest request)
+    const uniqueRemovals = new Map();
+    removalCommands.forEach(function(cmd) {
+      if (!uniqueRemovals.has(cmd.networkId) || uniqueRemovals.get(cmd.networkId).date < cmd.date) {
+        uniqueRemovals.set(cmd.networkId, cmd);
+      }
+    });
+    
+    // Get existing removed networks to avoid duplicates
+    const alreadyRemoved = getRemovedNetworks(ss);
+    const successfulRemovals = [];
+    
+    uniqueRemovals.forEach(function(cmd, networkId) {
+      if (alreadyRemoved.has(networkId)) {
+        Logger.log("Network " + networkId + " already removed. Skipping.");
+        return;
+      }
+      
+      // Find network in Networks sheet
+      const networksData = networksSheet.getDataRange().getValues();
+      let networkName = "Unknown";
+      let rowToDelete = -1;
+      
+      for (let i = 1; i < networksData.length; i++) {
+        if (String(networksData[i][0]).trim() === networkId) {
+          networkName = networksData[i][1] || "Unknown";
+          rowToDelete = i + 1;
+          break;
+        }
+      }
+      
+      // Add to Removed Networks sheet with Gmail source link
+      const gmailLink = "https://mail.google.com/mail/u/0/#all/" + cmd.messageId;
+      const newRow = [networkId, networkName, cmd.from, Utilities.formatDate(cmd.date, Session.getScriptTimeZone(), "MM/dd/yyyy HH:mm:ss"), gmailLink];
+      removedSheet.appendRow(newRow);
+      
+      // Delete from Networks sheet if found
+      if (rowToDelete > 0) {
+        networksSheet.deleteRow(rowToDelete);
+      }
+      
+      successfulRemovals.push({ networkId: networkId, networkName: networkName, from: cmd.from });
+    });
+    
+    // Send confirmation email to bkaufman@horizonmedia.com
+    if (successfulRemovals.length > 0) {
+      let confirmBody = "<p>The following networks were removed from CM360 QA monitoring:</p>";
+      confirmBody += "<table border='1' cellpadding='5' cellspacing='0' style='border-collapse: collapse;'>";
+      confirmBody += "<tr style='background-color: #f2f2f2; font-weight: bold;'><th>Network ID</th><th>Network Name</th><th>Requested By</th></tr>";
+      
+      successfulRemovals.forEach(function(removal) {
+        confirmBody += "<tr><td>" + removal.networkId + "</td><td>" + removal.networkName + "</td><td>" + removal.from + "</td></tr>";
+      });
+      
+      confirmBody += "</table>";
+      
+      MailApp.sendEmail({
+        to: "bkaufman@horizonmedia.com",
+        subject: "CM360 QA Networks Removed - Confirmation",
+        htmlBody: confirmBody
+      });
+      Logger.log("Sent removal confirmation for " + successfulRemovals.length + " networks");
+    }
+    
+    return successfulRemovals;
+  } catch (error) {
+    Logger.log("Failed to process network removal requests: " + error);
+    // Send error notification to admin
+    try {
+      MailApp.sendEmail({
+        to: "bkaufman@horizonmedia.com",
+        subject: "ERROR: CM360 QA Network Removal Failed",
+        body: "An error occurred while processing network removal requests:\n\n" + error
+      });
+    } catch (emailError) {
+      Logger.log("Failed to send error notification email: " + emailError);
+    }
+    return [];
+  }
+}
+
+/**
+ * Backfills missing Source Email links in the Removed Networks sheet
+ * Searches Gmail for the original removal request emails and adds links to column E
+ */
+function backfillSourceEmailLinks() {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const removedSheet = ss.getSheetByName("Removed Networks");
+    
+    if (!removedSheet || removedSheet.getLastRow() < 2) {
+      Logger.log("No removed networks to backfill");
+      return 0;
+    }
+    
+    const lastRow = removedSheet.getLastRow();
+    const data = removedSheet.getRange(2, 1, lastRow - 1, 5).getValues(); // Get all columns A-E
+    let updatedCount = 0;
+    const exampleNetworkIds = new Set(["12345", "67890", "99999"]);
+    
+    for (let i = 0; i < data.length; i++) {
+      const networkId = String(data[i][0]).trim();
+      const sourceEmail = data[i][4]; // Column E (index 4)
+      
+      // Skip if already has a link or is an example ID
+      if (sourceEmail || !networkId || exampleNetworkIds.has(networkId)) {
+        continue;
+      }
+      
+      // Search Gmail for this network ID removal request
+      try {
+        const threads = GmailApp.search('subject:"CM360 CPC/CPM FLIGHT QA" "REMOVE NETWORK ' + networkId + '"');
+        
+        if (threads.length > 0) {
+          // Find the message with the removal command
+          let foundMessageId = null;
+          const regex = new RegExp("REMOVE\\s+NETWORK\\s+" + networkId, "i");
+          
+          for (let j = 0; j < threads.length; j++) {
+            const messages = threads[j].getMessages();
+            for (let k = 0; k < messages.length; k++) {
+              if (regex.test(messages[k].getPlainBody())) {
+                foundMessageId = messages[k].getId();
+                break;
+              }
+            }
+            if (foundMessageId) break;
+          }
+          
+          if (foundMessageId) {
+            const gmailLink = "https://mail.google.com/mail/u/0/#all/" + foundMessageId;
+            removedSheet.getRange(i + 2, 5).setValue(gmailLink); // Row i+2, Column E
+            updatedCount++;
+            Logger.log("Added source email link for network " + networkId);
+          } else {
+            Logger.log("Could not find removal message for network " + networkId);
+          }
+        }
+      } catch (searchError) {
+        Logger.log("Failed to search for network " + networkId + ": " + searchError);
+      }
+      
+      // Add a small delay to avoid quota issues
+      if (updatedCount > 0 && updatedCount % 10 === 0) {
+        Utilities.sleep(1000);
+      }
+    }
+    
+    Logger.log("Backfill complete: Updated " + updatedCount + " source email links");
+    return updatedCount;
+    
+  } catch (error) {
+    Logger.log("Failed to backfill source email links: " + error);
+    try {
+      MailApp.sendEmail({
+        to: "bkaufman@horizonmedia.com",
+        subject: "ERROR: Backfill Source Email Links Failed",
+        body: "An error occurred while backfilling source email links:\n\n" + error
+      });
+    } catch (emailError) {
+      Logger.log("Failed to send error notification: " + emailError);
+    }
+    return 0;
+  }
+}
+
 function importDCMReports() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
+  
+  // Process network removal requests FIRST (before importing data)
+  processNetworkRemovalRequests();
+  
+  // Get list of removed networks to filter out
+  const removedNetworks = getRemovedNetworks(ss);
+  
   const dataSheet = ss.getSheetByName("Raw Data") || ss.insertSheet("Raw Data");
   const outputSheet = ss.getSheetByName("Violations") || ss.insertSheet("Violations");
   const label = "CM360 QA";
@@ -592,12 +872,27 @@ function importDCMReports() {
     thread.getMessages().forEach(function(message){
       message.getAttachments().forEach(function(att){
         const netId = extractNetworkId(att.getName());
+        
+        // Skip if network is in the removed list
+        if (removedNetworks.has(netId)) {
+          Logger.log("Skipping removed network: " + netId);
+          return;
+        }
+        
         if (att.getContentType() === "text/csv" || att.getName().endsWith(".csv")) {
           extractedData = extractedData.concat(processCSV(att.getDataAsString(), netId));
         } else if (att.getContentType() === "application/zip") {
           Utilities.unzip(att.copyBlob()).forEach(function(file){
+            const nestedNetId = extractNetworkId(file.getName());
+            
+            // Skip if network is in the removed list
+            if (removedNetworks.has(nestedNetId)) {
+              Logger.log("Skipping removed network: " + nestedNetId);
+              return;
+            }
+            
             if (file.getContentType() === "text/csv" || file.getName().endsWith(".csv")) {
-              extractedData = extractedData.concat(processCSV(file.getDataAsString(), extractNetworkId(file.getName())));
+              extractedData = extractedData.concat(processCSV(file.getDataAsString(), nestedNetId));
             }
           });
         }
@@ -627,6 +922,9 @@ function autoAddNewNetworks_() {
     return;
   }
   
+  // Get removed networks to exclude them
+  const removedNetworks = getRemovedNetworks(ss);
+  
   // Get all Network IDs from Raw Data (column A, skip header)
   const rawDataLastRow = rawDataSheet.getLastRow();
   if (rawDataLastRow < 2) {
@@ -636,7 +934,7 @@ function autoAddNewNetworks_() {
   
   const rawNetworkIds = rawDataSheet.getRange(2, 1, rawDataLastRow - 1, 1).getValues()
     .map(function(row){ return String(row[0] || "").trim(); })
-    .filter(function(id){ return id && id !== "Unknown"; });
+    .filter(function(id){ return id && id !== "Unknown" && !removedNetworks.has(id); });
   
   // Get unique Network IDs
   const uniqueRawNetIds = {};
