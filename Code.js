@@ -5,6 +5,12 @@
 // filters out ignored advertisers, and emails a summary of violations.
 
 // ---------------------
+// GLOBAL CONSTANTS
+// ---------------------
+const CPC_RATE = 0.008;  // $8 per 1000 clicks
+const CPM_RATE = 0.034;  // $34 per 1000 impressions
+
+// ---------------------
 // onOpen: Menu Setup
 // ---------------------
 function onOpen() {
@@ -36,6 +42,8 @@ function onOpen() {
     .addSeparator()
     .addItem("Process Network Removal Requests", "processNetworkRemovalRequests")
     .addItem("Backfill Source Email Links", "backfillSourceEmailLinks")
+    .addSeparator()
+    .addItem("💰 Show Current Month Overage", "showCurrentMonthOverage")
     .addSeparator()
     .addItem("Clear Violations", "clearViolations")
     .addToUi();
@@ -160,10 +168,14 @@ function processEmailReplies() {
     
     // Process each message in the thread
     messages.forEach(function(message) {
-      // Only process replies (not the original email)
-      if (!message.getSubject().startsWith("Re:")) return;
-      
       const sender = message.getFrom();
+      
+      // Only process replies (not the original email) - check if sender is NOT the script account
+      const scriptEmail = Session.getActiveUser().getEmail() || "platformsolutionsadopshorizon@gmail.com";
+      if (sender.toLowerCase().indexOf(scriptEmail.toLowerCase()) !== -1) {
+        return; // Skip messages from the script account itself
+      }
+      
       const messageDate = message.getDate();
       const body = message.getPlainBody();
       
@@ -345,6 +357,7 @@ function storeHandledPlacements_(placementIds, note, sender, messageDate, violat
     if (pid) {
       handledMap[pid] = {
         rowIndex: i + 1,
+        existingNote: String(row[hHeaders.indexOf("Note")] || "").trim(),
         emails: String(row[hHeaders.indexOf("Email Addresses")] || "").trim()
       };
     }
@@ -352,6 +365,7 @@ function storeHandledPlacements_(placementIds, note, sender, messageDate, violat
   
   const dateStr = Utilities.formatDate(messageDate, Session.getScriptTimeZone(), "yyyy-MM-dd HH:mm");
   const senderEmail = extractEmail_(sender);
+  const senderName = sender.split("<")[0].trim() || senderEmail; // Extract name from "John Doe <email@example.com>"
   
   let stored = 0;
   const invalid = [];
@@ -367,8 +381,9 @@ function storeHandledPlacements_(placementIds, note, sender, messageDate, violat
     
     // Check if already handled
     if (handledMap[pid]) {
-      // Update existing: append email if not already there, update note and date
+      // Append new note instead of overwriting
       const rowIdx = handledMap[pid].rowIndex;
+      const existingNote = handledMap[pid].existingNote;
       const existingEmails = handledMap[pid].emails;
       
       let emailList = existingEmails ? existingEmails.split(", ") : [];
@@ -376,11 +391,16 @@ function storeHandledPlacements_(placementIds, note, sender, messageDate, violat
         emailList.push(senderEmail);
       }
       
-      handledSheet.getRange(rowIdx, hHeaders.indexOf("Note") + 1).setValue(note);
+      // Append new note with sender name and timestamp
+      const newNoteEntry = "[" + senderName + " - " + dateStr + "] " + note;
+      const combinedNote = existingNote ? existingNote + "\n" + newNoteEntry : newNoteEntry;
+      
+      handledSheet.getRange(rowIdx, hHeaders.indexOf("Note") + 1).setValue(combinedNote);
       handledSheet.getRange(rowIdx, hHeaders.indexOf("Note-Date Last Updated") + 1).setValue(dateStr);
       handledSheet.getRange(rowIdx, hHeaders.indexOf("Email Addresses") + 1).setValue(emailList.join(", "));
     } else {
-      // Add new row
+      // Add new row with formatted note
+      const formattedNote = "[" + senderName + " - " + dateStr + "] " + note;
       const newRow = [
         vData.advertiser,
         vData.campaign,
@@ -389,7 +409,7 @@ function storeHandledPlacements_(placementIds, note, sender, messageDate, violat
         vData.impr,
         vData.clicks,
         vData.issues,
-        note,
+        formattedNote,
         dateStr,
         senderEmail
       ];
@@ -1935,6 +1955,96 @@ function scoreAndLabelLowPriority_(placementName, clicks, impr, rowIdOrIndex, ga
 }
 
 
+// ---------------------
+// Monthly Overage Tracking
+// ---------------------
+
+/**
+ * Logs overage costs for CPC+CPM violations to Monthly Overages sheet
+ * @param {string} networkId - Network ID
+ * @param {string} advertiser - Advertiser name
+ * @param {string} placementId - Placement ID
+ * @param {string} placementName - Placement name
+ * @param {number} overage - Calculated overage amount
+ * @param {Date} reportDate - Report date
+ */
+function logMonthlyOverage_(networkId, advertiser, placementId, placementName, overage, reportDate) {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    let overageSheet = ss.getSheetByName("Monthly Overages");
+    
+    // Create sheet if it doesn't exist
+    if (!overageSheet) {
+      overageSheet = ss.insertSheet("Monthly Overages");
+      const headers = ["Date", "Month", "Network ID", "Advertiser", "Placement ID", "Placement", "Overage"];
+      overageSheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+      overageSheet.getRange(1, 1, 1, headers.length).setFontWeight("bold");
+      overageSheet.setFrozenRows(1);
+    }
+    
+    // Format date as YYYY-MM-DD and month as YYYY-MM
+    const dateStr = Utilities.formatDate(reportDate, Session.getScriptTimeZone(), "yyyy-MM-dd");
+    const monthStr = Utilities.formatDate(reportDate, Session.getScriptTimeZone(), "yyyy-MM");
+    
+    // Append the overage record
+    overageSheet.appendRow([
+      dateStr,
+      monthStr,
+      networkId,
+      advertiser,
+      placementId,
+      placementName,
+      overage
+    ]);
+    
+  } catch (error) {
+    Logger.log("Failed to log monthly overage: " + error);
+  }
+}
+
+/**
+ * Gets total overages for a specific month (format: "YYYY-MM")
+ * @param {string} monthStr - Month string (e.g., "2026-02")
+ * @returns {number} Total overage for the month
+ */
+function getMonthlyOverageTotal(monthStr) {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const overageSheet = ss.getSheetByName("Monthly Overages");
+    
+    if (!overageSheet || overageSheet.getLastRow() < 2) {
+      return 0;
+    }
+    
+    const data = overageSheet.getDataRange().getValues();
+    let total = 0;
+    
+    // Skip header row (index 0)
+    for (let i = 1; i < data.length; i++) {
+      const month = data[i][1]; // Column B: Month
+      const overage = parseFloat(data[i][6]) || 0; // Column G: Overage
+      
+      if (month === monthStr) {
+        total += overage;
+      }
+    }
+    
+    return total;
+  } catch (error) {
+    Logger.log("Failed to calculate monthly overage total: " + error);
+    return 0;
+  }
+}
+
+/**
+ * Gets current month's total overage
+ * @returns {number} Total overage for current month
+ */
+function getCurrentMonthOverage() {
+  const today = new Date();
+  const monthStr = Utilities.formatDate(today, Session.getScriptTimeZone(), "yyyy-MM");
+  return getMonthlyOverageTotal(monthStr);
+}
 
 
 // ---------------------
@@ -2078,7 +2188,12 @@ function runQAOnly() {
       }
       if (cpc > 0 && cpm > 0 && clk > imp && cpc > 10) {
         issueTypes.push("🟩 COST: CPC+CPM Clicks > Impr & CPC > $10");
-        details.push("Clicks > impressions with both CPC and CPM charges (CPC = $" + cpc.toFixed(2) + ")");
+        // Calculate overage: imps × (CPM_RATE - CPC_RATE)
+        const overage = imp * (CPM_RATE - CPC_RATE);
+        details.push("Clicks > impressions with both CPC and CPM charges (CPC = $" + cpc.toFixed(2) + ", Overage = $" + overage.toFixed(2) + ")");
+        
+        // Track monthly overage
+        logMonthlyOverage_(row[m["Network ID"]], row[m["Advertiser"]], row[m["Placement ID"]], row[m["Placement"]], overage, rd);
       }
 
       // --- Low-priority tagging via scorer (gating-aware) — no sheet writes ---
@@ -2872,7 +2987,7 @@ function buildImmediateAttentionHtmlForOwners_(owners, perOwner) {
            +  "<td>" + o.imp + "</td>"
            +  "<td>" + o.clk + "</td>"
            +  "<td>" + o.issue + "</td>"
-           +  '<td style="font-style:italic;">✓ ' + h.note + '</td>'
+           +  '<td style="font-style:italic;">✓ ' + h.note.replace(/\n/g, '<br/>') + '</td>'
            +  "</tr>";
     }
     
@@ -3250,10 +3365,6 @@ function generateMidFlightDropHtml_() {
   const snapshots = [];
   const dropAlerts = [];
 
-  // CPC/CPM calculation constants
-  const CPC_RATE = 0.008;  // $8 per 1000 clicks
-  const CPM_RATE = 0.034;  // $0.034 per 1000 impressions
-
   Logger.log('    ⏱️ Processing rows for mid-flight drops...');
   let processedRows = 0;
   let checkedRows = 0;
@@ -3566,6 +3677,32 @@ function showSystemStatus() {
   }
   
   ui.alert('System Status', status, ui.ButtonSet.OK);
+}
+
+// ---------------------
+// showCurrentMonthOverage - Display current month's overage total
+// ---------------------
+function showCurrentMonthOverage() {
+  const ui = SpreadsheetApp.getUi();
+  
+  try {
+    const today = new Date();
+    const monthStr = Utilities.formatDate(today, Session.getScriptTimeZone(), "MMMM yyyy");
+    const monthKey = Utilities.formatDate(today, Session.getScriptTimeZone(), "yyyy-MM");
+    
+    const total = getMonthlyOverageTotal(monthKey);
+    
+    let message = '💰 Current Month Overage Report\n\n';
+    message += 'Month: ' + monthStr + '\n';
+    message += 'Total Overage: $' + total.toFixed(2) + '\n\n';
+    message += 'This represents the extra cost charged due to CPC+CPM violations\n';
+    message += '(placements with clicks > impressions where both CPC and CPM are billed).\n\n';
+    message += 'View the "Monthly Overages" sheet for detailed breakdown.';
+    
+    ui.alert('Monthly Overage Total', message, ui.ButtonSet.OK);
+  } catch (error) {
+    ui.alert('Error', 'Failed to calculate monthly overage: ' + error, ui.ButtonSet.OK);
+  }
 }
 
 function resetAllState() {
