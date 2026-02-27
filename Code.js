@@ -381,19 +381,25 @@ function storeHandledPlacements_(placementIds, note, sender, messageDate, violat
     
     // Check if already handled
     if (handledMap[pid]) {
-      // Append new note instead of overwriting
+      // Append new note instead of overwriting (prevent duplicates)
       const rowIdx = handledMap[pid].rowIndex;
       const existingNote = handledMap[pid].existingNote;
       const existingEmails = handledMap[pid].emails;
+      
+      // Check if this exact note entry already exists (prevent re-processing same email)
+      const newNoteEntry = "[" + senderName + " - " + dateStr + "] " + note;
+      if (existingNote.indexOf(newNoteEntry) !== -1) {
+        // Already processed this exact note - skip
+        return;
+      }
       
       let emailList = existingEmails ? existingEmails.split(", ") : [];
       if (emailList.indexOf(senderEmail) === -1) {
         emailList.push(senderEmail);
       }
       
-      // Append new note with sender name and timestamp
-      const newNoteEntry = "[" + senderName + " - " + dateStr + "] " + note;
-      const combinedNote = existingNote ? existingNote + "\n" + newNoteEntry : newNoteEntry;
+      // Prepend new note (newest first) instead of appending
+      const combinedNote = existingNote ? newNoteEntry + "\n" + existingNote : newNoteEntry;
       
       handledSheet.getRange(rowIdx, hHeaders.indexOf("Note") + 1).setValue(combinedNote);
       handledSheet.getRange(rowIdx, hHeaders.indexOf("Note-Date Last Updated") + 1).setValue(dateStr);
