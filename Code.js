@@ -2224,8 +2224,8 @@ function runQAOnly() {
       const ctr = imp > 0 ? (clk / imp) * 100 : 0;
 
       // Your CPC/CPM formulas
-      const cpc = clk * 0.008;
-      const cpm = (imp / 1000) * 0.034;
+      const cpc = clk * CPC_RATE;
+      const cpm = (imp / 1000) * CPM_RATE;
 
       const ps  = new Date(row[m["Placement Start Date"]]);
       const pe  = new Date(row[m["Placement End Date"]]);
