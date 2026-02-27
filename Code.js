@@ -1980,7 +1980,7 @@ function scoreAndLabelLowPriority_(placementName, clicks, impr, rowIdOrIndex, ga
 // ---------------------
 
 /**
- * Logs overage costs for CPC+CPM violations to Monthly Overages sheet
+ * Logs overage costs for CPC+CPM violations to Monthly Overages sheet (monthly rollup)
  * @param {string} networkId - Network ID
  * @param {string} advertiser - Advertiser name
  * @param {string} placementId - Placement ID
@@ -1996,26 +1996,105 @@ function logMonthlyOverage_(networkId, advertiser, placementId, placementName, o
     // Create sheet if it doesn't exist
     if (!overageSheet) {
       overageSheet = ss.insertSheet("Monthly Overages");
-      const headers = ["Date", "Month", "Network ID", "Advertiser", "Placement ID", "Placement", "Overage"];
+      const headers = ["Month", "Network ID", "Advertiser", "Placement ID", "Placement", "Total Overage", "Last Updated"];
       overageSheet.getRange(1, 1, 1, headers.length).setValues([headers]);
       overageSheet.getRange(1, 1, 1, headers.length).setFontWeight("bold");
       overageSheet.setFrozenRows(1);
+    } else {
+      // Migrate old daily format if needed
+      const headerRow = overageSheet.getRange(1, 1, 1, 7).getValues()[0];
+      if (String(headerRow[0]) === "Date") {
+        const lastRow = overageSheet.getLastRow();
+        const data = lastRow > 1 ? overageSheet.getRange(2, 1, lastRow - 1, 7).getValues() : [];
+        const rollup = {};
+        
+        data.forEach(function(row) {
+          const month = String(row[1] || "").trim();
+          const netId = String(row[2] || "").trim();
+          const adv = String(row[3] || "").trim();
+          const pid = String(row[4] || "").trim();
+          const plc = String(row[5] || "").trim();
+          const amt = parseFloat(row[6]) || 0;
+          if (!month || !netId || !pid) return;
+          const key = month + "|" + netId + "|" + pid;
+          if (!rollup[key]) {
+            rollup[key] = { month: month, netId: netId, adv: adv, pid: pid, plc: plc, total: 0, lastUpdated: "" };
+          }
+          rollup[key].total += amt;
+          rollup[key].lastUpdated = row[0] || rollup[key].lastUpdated;
+        });
+        
+        const newHeaders = ["Month", "Network ID", "Advertiser", "Placement ID", "Placement", "Total Overage", "Last Updated"];
+        overageSheet.clear();
+        overageSheet.getRange(1, 1, 1, newHeaders.length).setValues([newHeaders]);
+        overageSheet.getRange(1, 1, 1, newHeaders.length).setFontWeight("bold");
+        overageSheet.setFrozenRows(1);
+        
+        const rows = Object.keys(rollup).map(function(key) {
+          const r = rollup[key];
+          return [r.month, r.netId, r.adv, r.pid, r.plc, r.total, r.lastUpdated];
+        });
+        if (rows.length) {
+          overageSheet.getRange(2, 1, rows.length, newHeaders.length).setValues(rows);
+        }
+      }
     }
     
     // Format date as YYYY-MM-DD and month as YYYY-MM
     const dateStr = Utilities.formatDate(reportDate, Session.getScriptTimeZone(), "yyyy-MM-dd");
     const monthStr = Utilities.formatDate(reportDate, Session.getScriptTimeZone(), "yyyy-MM");
     
-    // Append the overage record
-    overageSheet.appendRow([
-      dateStr,
-      monthStr,
-      networkId,
-      advertiser,
-      placementId,
-      placementName,
-      overage
-    ]);
+    // Find existing row for this month + network + placement
+    const lastRow = overageSheet.getLastRow();
+    let rowToUpdate = -1;
+    let currentTotal = 0;
+    
+    if (lastRow > 1) {
+      const data = overageSheet.getRange(2, 1, lastRow - 1, 7).getValues();
+      for (let i = 0; i < data.length; i++) {
+        const rowMonth = String(data[i][0] || "").trim();
+        const rowNetwork = String(data[i][1] || "").trim();
+        const rowPlacementId = String(data[i][3] || "").trim();
+        if (rowMonth === monthStr && rowNetwork === String(networkId) && rowPlacementId === String(placementId)) {
+          rowToUpdate = i + 2; // sheet row number
+          currentTotal = parseFloat(data[i][5]) || 0;
+          break;
+        }
+      }
+    }
+    
+    const newTotal = currentTotal + overage;
+    
+    if (rowToUpdate > 0) {
+      overageSheet.getRange(rowToUpdate, 3).setValue(advertiser);
+      overageSheet.getRange(rowToUpdate, 5).setValue(placementName);
+      overageSheet.getRange(rowToUpdate, 6).setValue(newTotal);
+      overageSheet.getRange(rowToUpdate, 7).setValue(dateStr);
+    } else {
+      overageSheet.appendRow([
+        monthStr,
+        networkId,
+        advertiser,
+        placementId,
+        placementName,
+        newTotal,
+        dateStr
+      ]);
+    }
+    
+    // Apply filter to show only totals >= $10 and sort by Total Overage (desc)
+    const updatedLastRow = overageSheet.getLastRow();
+    if (updatedLastRow > 1) {
+      const range = overageSheet.getRange(1, 1, updatedLastRow, 7);
+      if (overageSheet.getFilter()) {
+        overageSheet.getFilter().remove();
+      }
+      range.createFilter();
+      const filter = overageSheet.getFilter();
+      const criteria = SpreadsheetApp.newFilterCriteria().whenNumberGreaterThanOrEqualTo(10).build();
+      filter.setColumnFilterCriteria(6, criteria); // Total Overage column
+      range.sort({ column: 6, ascending: false });
+    }
     
   } catch (error) {
     Logger.log("Failed to log monthly overage: " + error);
@@ -2041,8 +2120,8 @@ function getMonthlyOverageTotal(monthStr) {
     
     // Skip header row (index 0)
     for (let i = 1; i < data.length; i++) {
-      const month = data[i][1]; // Column B: Month
-      const overage = parseFloat(data[i][6]) || 0; // Column G: Overage
+      const month = data[i][0]; // Column A: Month
+      const overage = parseFloat(data[i][5]) || 0; // Column F: Total Overage
       
       if (month === monthStr) {
         total += overage;
