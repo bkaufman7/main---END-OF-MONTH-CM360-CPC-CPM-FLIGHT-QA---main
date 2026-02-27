@@ -2287,8 +2287,8 @@ function runQAOnly() {
       }
       if (cpc > 0 && cpm > 0 && clk > imp && cpc > 10) {
         issueTypes.push("🟩 COST: CPC+CPM Clicks > Impr & CPC > $10");
-        // Calculate overage: CPM cost on impressions (billed as both CPM and CPC)
-        const overage = (imp / 1000) * CPM_RATE;
+        // Calculate overage: cost of extra clicks that exceed impressions
+        const overage = (clk - imp) * CPC_RATE;
         details.push("Clicks > impressions with both CPC and CPM charges (CPC = $" + cpc.toFixed(2) + ", Overage = $" + overage.toFixed(2) + ")");
         
         // Track monthly overage
