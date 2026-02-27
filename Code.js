@@ -7,8 +7,8 @@
 // ---------------------
 // GLOBAL CONSTANTS
 // ---------------------
-const CPC_RATE = 0.008;  // $8 per 1000 clicks
-const CPM_RATE = 0.034;  // $34 per 1000 impressions
+const CPC_RATE = 0.008;  // $0.008 per click ($8 per 1000 clicks)
+const CPM_RATE = 0.034;  // $0.034 per 1000 impressions (3.4 cents per 1000)
 
 // ---------------------
 // onOpen: Menu Setup
@@ -2287,8 +2287,8 @@ function runQAOnly() {
       }
       if (cpc > 0 && cpm > 0 && clk > imp && cpc > 10) {
         issueTypes.push("🟩 COST: CPC+CPM Clicks > Impr & CPC > $10");
-        // Calculate overage: imps × (CPM_RATE - CPC_RATE)
-        const overage = imp * (CPM_RATE - CPC_RATE);
+        // Calculate overage: CPM cost on impressions (billed as both CPM and CPC)
+        const overage = (imp / 1000) * CPM_RATE;
         details.push("Clicks > impressions with both CPC and CPM charges (CPC = $" + cpc.toFixed(2) + ", Overage = $" + overage.toFixed(2) + ")");
         
         // Track monthly overage
@@ -3493,7 +3493,7 @@ function generateMidFlightDropHtml_() {
     
     // Calculate costs
     const cpc = clk > 0 ? (clk * CPC_RATE) : 0;
-    const cpm = imp > 0 ? (imp * CPM_RATE) : 0;
+    const cpm = imp > 0 ? ((imp / 1000) * CPM_RATE) : 0;
     
     // Filter: Must have CPM >= $10 OR CPC >= $10
     if (cpc < 10 && cpm < 10) return;
@@ -4053,8 +4053,8 @@ function debugQALogic() {
     
     // Calculate metrics
     const ctr = (imp > 0) ? (clk / imp * 100) : 0;
-    const cpc = (clk > 0) ? (clk * 0.008) : 0;
-    const cpm = (imp > 0) ? (imp * 0.034) : 0;
+    const cpc = (clk > 0) ? (clk * CPC_RATE) : 0;
+    const cpm = (imp > 0) ? ((imp / 1000) * CPM_RATE) : 0;
     
     let violations = [];
     
