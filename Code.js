@@ -163,11 +163,21 @@ function processEmailReplies() {
   let networksRemovedCount = 0;
   let errorCount = 0;
   
+    // Track which messages we've already processed (by message ID) to prevent duplicates
+    const processedMessageIds = {};
+  
   threads.forEach(function(thread) {
     const messages = thread.getMessages();
     
     // Process each message in the thread
     messages.forEach(function(message) {
+            const messageId = message.getId();
+      
+            // Skip if we've already processed this message
+            if (processedMessageIds[messageId]) {
+              return;
+            }
+      
       const sender = message.getFrom();
       
       // Only process replies (not the original email) - check if sender is NOT the script account
@@ -186,6 +196,7 @@ function processEmailReplies() {
         Logger.log("❌ Parse error from " + sender + ": " + parseResult.error);
         sendReplyErrorEmail_(sender, parseResult.error);
         errorCount++;
+          processedMessageIds[messageId] = true; // Mark as processed even on error
         return;
       }
       
@@ -194,6 +205,7 @@ function processEmailReplies() {
         const removed = removeNetworks_(parseResult.networkIds, sender);
         networksRemovedCount += removed;
         Logger.log("🗑️ " + sender + " removed " + removed + " network(s): " + parseResult.networkIds.join(", "));
+          processedMessageIds[messageId] = true;
         return;
       }
       
@@ -212,6 +224,8 @@ function processEmailReplies() {
         
         if (result.invalid.length > 0) {
           Logger.log("⚠️ Invalid placement IDs from " + sender + ": " + result.invalid.join(", "));
+        
+          processedMessageIds[messageId] = true; // Mark as processed
         }
       }
     });
