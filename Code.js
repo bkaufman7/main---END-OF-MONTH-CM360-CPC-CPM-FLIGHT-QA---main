@@ -1,4 +1,4 @@
-// =====================
+﻿// =====================
 // CM360 QA Tools Script
 // =====================
 // Adds custom menu, imports CM360 reports via Gmail, runs QA checks,
@@ -9,6 +9,7 @@
 // ---------------------
 const CPC_RATE = 0.008;  // $0.008 per click ($8 per 1000 clicks)
 const CPM_RATE = 0.034;  // $0.034 per 1000 impressions (3.4 cents per 1000)
+const TEST_EMAIL_RECIPIENT = 'bkaufman@horizonmedia.com';
 
 // ---------------------
 // onOpen: Menu Setup
@@ -26,6 +27,7 @@ function onOpen() {
     .addItem("Send Email Only (Immediate)", "sendEmailSummaryImmediate")
     .addItem("Send Email Only (Auto-Resume)", "sendEmailSummary")
     .addItem("FORCE Send Email Now", "sendEmailNow")
+    .addItem("Test Send Both Emails (BK only)", "sendTestEmailsToBk")
     .addSeparator()
     .addItem("� Debug QA Filtering", "debugQAFiltering")
     .addItem("🔍 Count Non-Zero Rows", "countNonZeroRows")
@@ -61,6 +63,49 @@ function authorizeMail_() {
     subject: 'Apps Script auth test',
     htmlBody: 'If you received this, MailApp is authorized.'
   });
+}
+
+function normalizeRecipientEmails_(emails) {
+  return Array.from(new Set((emails || [])
+    .map(function(email) { return String(email || '').trim(); })
+    .filter(Boolean)));
+}
+
+function getRecipientEmails_(recipientsSheet, overrideRecipients) {
+  if (overrideRecipients && overrideRecipients.length) {
+    return normalizeRecipientEmails_(overrideRecipients);
+  }
+
+  if (!recipientsSheet) return [];
+
+  return normalizeRecipientEmails_(recipientsSheet.getRange("A2:A").getValues().flat());
+}
+
+function sendTestEmailsToBk() {
+  const ui = SpreadsheetApp.getUi();
+  const testRecipients = [TEST_EMAIL_RECIPIENT];
+
+  clearEmailState_();
+  cancelEmailChunkTrigger_();
+
+  const perfResult = sendPerformanceSpikeAlertIfPre15({
+    skipDateCheck: true,
+    overrideRecipients: testRecipients,
+    testMode: true
+  });
+
+  sendEmailSummaryChunked_(true, true, testRecipients);
+
+  const perfMessage = perfResult.sent
+    ? ('Performance alert sent to ' + TEST_EMAIL_RECIPIENT + ' with ' + perfResult.rowCount + ' changed/new row(s).')
+    : ('Performance alert not sent. ' + perfResult.reason);
+
+  ui.alert(
+    'BK test send started.\n\n'
+    + perfMessage + '\n'
+    + 'Monthly summary is being sent only to ' + TEST_EMAIL_RECIPIENT + '.\n'
+    + 'If the summary needs to auto-resume, the follow-up chunks will keep using the BK-only recipient override.'
+  );
 }
 
 // ---------------------
@@ -154,17 +199,28 @@ function processEmailReplies() {
   const startOfMonth = new Date(today.getFullYear(), today.getMonth(), 1);
   const formattedStart = Utilities.formatDate(startOfMonth, Session.getScriptTimeZone(), "yyyy/MM/dd");
   
-  const searchQuery = 'subject:"Re: CM360 CPC/CPM FLIGHT QA" after:' + formattedStart;
-  const threads = GmailApp.search(searchQuery);
+  const commandSearches = [
+    'subject:"Re: CM360 CPC/CPM FLIGHT QA" after:' + formattedStart,
+    'subject:"Re: ALERT – PERFORMANCE (pre-monthly-summary)" after:' + formattedStart
+  ];
+
+  const threadMap = {};
+  commandSearches.forEach(function(q) {
+    GmailApp.search(q).forEach(function(t) {
+      threadMap[t.getId()] = t;
+    });
+  });
+  const threads = Object.keys(threadMap).map(function(k) { return threadMap[k]; });
   
   Logger.log("📧 Found " + threads.length + " reply threads");
   
   let processedCount = 0;
   let networksRemovedCount = 0;
+  let recipientsAddedCount = 0;
   let errorCount = 0;
   
-    // Track which messages we've already processed (by message ID) to prevent duplicates
-    const processedMessageIds = {};
+  // Track which messages we've already processed (by message ID) to prevent duplicates
+  const processedMessageIds = {};
   
   threads.forEach(function(thread) {
     const messages = thread.getMessages();
@@ -205,7 +261,16 @@ function processEmailReplies() {
         const removed = removeNetworks_(parseResult.networkIds, sender);
         networksRemovedCount += removed;
         Logger.log("🗑️ " + sender + " removed " + removed + " network(s): " + parseResult.networkIds.join(", "));
-          processedMessageIds[messageId] = true;
+        processedMessageIds[messageId] = true;
+        return;
+      }
+
+      // Handle ADD RECIPIENT commands
+      if (parseResult.type === 'ADD_RECIPIENT' && parseResult.recipientEmails.length > 0) {
+        const recipientResult = addRecipientsFromReply_(parseResult.recipientEmails, sender, messageDate);
+        recipientsAddedCount += recipientResult.added.length;
+        Logger.log("📬 " + sender + " add recipient request: added=" + recipientResult.added.length + ", duplicates=" + recipientResult.duplicates.length + ", invalidDomain=" + recipientResult.invalidDomain.length);
+        processedMessageIds[messageId] = true;
         return;
       }
       
@@ -224,9 +289,9 @@ function processEmailReplies() {
         
         if (result.invalid.length > 0) {
           Logger.log("⚠️ Invalid placement IDs from " + sender + ": " + result.invalid.join(", "));
-        
-          processedMessageIds[messageId] = true; // Mark as processed
         }
+
+        processedMessageIds[messageId] = true;
       }
     });
   });
@@ -234,6 +299,9 @@ function processEmailReplies() {
   Logger.log("✅ Processed " + processedCount + " placement notes from email replies");
   if (networksRemovedCount > 0) {
     Logger.log("✅ Removed " + networksRemovedCount + " network(s) from monitoring");
+  }
+  if (recipientsAddedCount > 0) {
+    Logger.log("✅ Added " + recipientsAddedCount + " recipient(s) to EMAIL LIST");
   }
   if (errorCount > 0) {
     Logger.log("⚠️ " + errorCount + " emails had errors");
@@ -283,7 +351,7 @@ function parseReplyEmail_(body) {
   }
   
   if (relevantLines.length === 0) {
-    return { error: null, note: null, placementIds: [], networkIds: [], type: null };
+    return { error: null, note: null, placementIds: [], networkIds: [], recipientEmails: [], type: null };
   }
   
   // Check if this is a REMOVE NETWORK command
@@ -302,7 +370,29 @@ function parseReplyEmail_(body) {
       type: 'REMOVE_NETWORK', 
       networkIds: networkIdsToRemove,
       note: null,
-      placementIds: []
+      placementIds: [],
+      recipientEmails: []
+    };
+  }
+
+  // Check if this is an ADD RECIPIENT command
+  const recipientEmailsToAdd = [];
+  for (let i = 0; i < relevantLines.length; i++) {
+    const line = relevantLines[i].trim();
+    const match = line.match(/^ADD\s+RECIPIENT\s+([A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,})$/i);
+    if (match) {
+      recipientEmailsToAdd.push(match[1].toLowerCase());
+    }
+  }
+
+  if (recipientEmailsToAdd.length > 0) {
+    return {
+      error: null,
+      type: 'ADD_RECIPIENT',
+      recipientEmails: recipientEmailsToAdd,
+      note: null,
+      placementIds: [],
+      networkIds: []
     };
   }
   
@@ -326,11 +416,12 @@ function parseReplyEmail_(body) {
       note: null,
       placementIds: [],
       networkIds: [],
+      recipientEmails: [],
       type: null
     };
   }
   
-  return { error: null, type: 'HANDLE_PLACEMENT', note: note, placementIds: placementIds, networkIds: [] };
+  return { error: null, type: 'HANDLE_PLACEMENT', note: note, placementIds: placementIds, networkIds: [], recipientEmails: [] };
 }
 
 // ---------------------
@@ -581,6 +672,136 @@ function sendReplyErrorEmail_(recipient, errorMessage) {
   } catch (e) {
     Logger.log("❌ Failed to send error email to " + recipientEmail + ": " + e.message);
   }
+}
+
+// ---------------------
+// buildReplyInstructionsFooterHtml_ - Shared instruction footer for report emails
+// ---------------------
+function buildReplyInstructionsFooterHtml_() {
+  return ''
+    + '<h3>📧 How to Mark Placements as Handled:</h3>'
+    + '<p>Reply to this email with the following format:</p>'
+    + '<pre style="background: #f5f5f5; padding: 10px;">'
+    + 'Your note describing what was done\n'
+    + '12345678\n'
+    + '87654321\n'
+    + '98765432'
+    + '</pre>'
+    + '<p>Handled placements will appear at the bottom of your section in future reports with a green checkmark.</p>'
+    + '<hr/>'
+    + '<h3>📧 To Remove a Network from Monitoring:</h3>'
+    + '<p>Reply to this email with "REMOVE NETWORK [ID]" in the body.</p>'
+    + '<p><b>Example (for multiple networks):</b></p>'
+    + '<pre style="background: #f5f5f5; padding: 10px;">'
+    + 'REMOVE NETWORK 12345\n'
+    + 'REMOVE NETWORK 67890\n'
+    + 'REMOVE NETWORK 99999'
+    + '</pre>'
+    + '<hr/>'
+    + '<h3>📧 To Add Email Recipients to This Report:</h3>'
+    + '<p>Reply to this email with "ADD RECIPIENT [email]" in the body.</p>'
+    + '<p><b>Only email addresses ending in @horizonmedia.com will be accepted through email replies.</b></p>'
+    + '<p><b>Example (for multiple recipients):</b></p>'
+    + '<pre style="background: #f5f5f5; padding: 10px;">'
+    + 'ADD RECIPIENT jane.doe@horizonmedia.com\n'
+    + 'ADD RECIPIENT john.smith@horizonmedia.com\n'
+    + 'ADD RECIPIENT teamlead@horizonmedia.com'
+    + '</pre>'
+    + '<p>Approved addresses will be added to the next available row in the EMAIL LIST sheet and included in future report sends.</p>'
+    + '<hr/>'
+    + '<h3>📋 How to Add a New Network Report:</h3>'
+    + '<ol>'
+    + '<li><b>Step 1:</b> Place this exact string into the AI helper in DCM Reports:<br/>'
+    + '<code>Advertiser, Placement ID, Placement, Campaign, Placement Start Date, Placement End Date, Campaign Start Date, Campaign End Date, Ad, Impressions, Clicks, This Month</code></li>'
+    + '<li><b>Step 2:</b> Set the report subject/label to exactly: <code>BKCM360 Global QA Check</code></li>'
+    + '<li><b>Step 3:</b> Set schedule with end date of Jan 1, 2030</li>'
+    + '<li><b>Step 4:</b> Ensure you CC this email exactly: <code>platformsolutionsadopshorizon@gmail.com</code></li>'
+    + '</ol>'
+    + '<hr/>'
+    + '<p><i>Brought to you by the Platform Solutions Automation. (Made by: BK)</i></p>';
+}
+
+// ---------------------
+// addRecipientsFromReply_ - Adds valid recipient emails from reply commands
+// ---------------------
+function addRecipientsFromReply_(recipientEmails, sender, messageDate) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let recipientsSheet = ss.getSheetByName("EMAIL LIST");
+
+  if (!recipientsSheet) {
+    recipientsSheet = ss.insertSheet("EMAIL LIST");
+    recipientsSheet.getRange(1, 1).setValue("Email");
+    recipientsSheet.getRange(1, 1).setFontWeight("bold");
+  }
+
+  const existing = recipientsSheet.getRange("A2:A").getValues()
+    .flat()
+    .map(function(e) { return String(e || "").trim().toLowerCase(); })
+    .filter(Boolean);
+  const existingSet = new Set(existing);
+
+  const added = [];
+  const duplicates = [];
+  const invalidDomain = [];
+
+  recipientEmails.forEach(function(email) {
+    const normalized = String(email || "").trim().toLowerCase();
+    if (!normalized) return;
+
+    if (!/@horizonmedia\.com$/i.test(normalized)) {
+      invalidDomain.push(normalized);
+      return;
+    }
+
+    if (existingSet.has(normalized)) {
+      duplicates.push(normalized);
+      return;
+    }
+
+    const nextRow = Math.max(2, recipientsSheet.getLastRow() + 1);
+    recipientsSheet.getRange(nextRow, 1).setValue(normalized);
+    existingSet.add(normalized);
+    added.push(normalized);
+  });
+
+  if (added.length > 0 || duplicates.length > 0 || invalidDomain.length > 0) {
+    sendRecipientListUpdateAlert_(sender, messageDate, added, duplicates, invalidDomain);
+  }
+
+  return { added: added, duplicates: duplicates, invalidDomain: invalidDomain };
+}
+
+// ---------------------
+// sendRecipientListUpdateAlert_ - Admin notification for recipient list updates
+// ---------------------
+function sendRecipientListUpdateAlert_(sender, messageDate, added, duplicates, invalidDomain) {
+  const adminEmail = "bkaufman@horizonmedia.com";
+  const dateStr = Utilities.formatDate(messageDate || new Date(), Session.getScriptTimeZone(), "MM/dd/yyyy HH:mm:ss");
+  const senderEmail = extractEmail_(sender);
+
+  let body = '<html><body style="font-family: Arial, sans-serif;">'
+    + '<h2 style="color: #2c3e50;">CM360 QA Recipient List Update</h2>'
+    + '<p><b>Requested By:</b> ' + sender + ' (' + senderEmail + ')</p>'
+    + '<p><b>Request Time:</b> ' + dateStr + '</p>'
+    + '<hr/>';
+
+  body += '<h3 style="color:#28a745;">Added (' + added.length + ')</h3>';
+  body += added.length ? ('<ul><li>' + added.join('</li><li>') + '</li></ul>') : '<p>None</p>';
+
+  body += '<h3 style="color:#f0ad4e;">Duplicates (' + duplicates.length + ')</h3>';
+  body += duplicates.length ? ('<ul><li>' + duplicates.join('</li><li>') + '</li></ul>') : '<p>None</p>';
+
+  body += '<h3 style="color:#d9534f;">Rejected (Non-horizon domain) (' + invalidDomain.length + ')</h3>';
+  body += invalidDomain.length ? ('<ul><li>' + invalidDomain.join('</li><li>') + '</li></ul>') : '<p>None</p>';
+
+  body += '<hr/><p style="color:#666;font-size:11px;"><i>Automated notification from CM360 QA Tools</i></p>';
+  body += '</body></html>';
+
+  MailApp.sendEmail({
+    to: adminEmail,
+    subject: "CM360 QA Recipient List Updated",
+    htmlBody: body
+  });
 }
 
 // ---------------------
@@ -1367,10 +1588,11 @@ function loadIgnoreAdvertisers() {
 // ---------------------
 // sendPerformanceSpikeAlertIfPre15
 // ---------------------
-function sendPerformanceSpikeAlertIfPre15() {
+function sendPerformanceSpikeAlertIfPre15(options) {
+  options = options || {};
   const today = new Date();
   const dayOfMonth = today.getDate();
-  if (dayOfMonth >= 15) return; // Only before 15th
+  if (!options.skipDateCheck && dayOfMonth >= 15) return { sent: false, reason: 'Blocked by pre-15 date window.', rowCount: 0, recipientCount: 0 }; // Only before 15th
 
   // Ensures the cache sheet exists before proceeding
   getPerfAlertCacheSheet_();
@@ -1378,18 +1600,14 @@ function sendPerformanceSpikeAlertIfPre15() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName("Violations");
   const recipientsSheet = ss.getSheetByName("EMAIL LIST");
-  if (!sheet || !recipientsSheet) return;
+  if (!sheet) return { sent: false, reason: 'Violations sheet not found.', rowCount: 0, recipientCount: 0 };
 
   // Recipient list
-  const emails = recipientsSheet.getRange("A2:A").getValues()
-    .flat()
-    .map(function(e){ return String(e || "").trim(); })
-    .filter(Boolean);
-  const uniqueEmails = Array.from(new Set(emails));
-  if (uniqueEmails.length === 0) return;
+  const uniqueEmails = getRecipientEmails_(recipientsSheet, options.overrideRecipients);
+  if (uniqueEmails.length === 0) return { sent: false, reason: 'No recipients found.', rowCount: 0, recipientCount: 0 };
 
   const values = sheet.getDataRange().getValues();
-  if (values.length <= 1) return;
+  if (values.length <= 1) return { sent: false, reason: 'No violation rows found.', rowCount: 0, recipientCount: uniqueEmails.length };
 
   const headers = values[0];
   const hMap = {};
@@ -1399,7 +1617,7 @@ function sendPerformanceSpikeAlertIfPre15() {
     "Network ID", "Report Date", "Advertiser", "Campaign",
     "Placement ID", "Placement", "Impressions", "Clicks", "Issue Type", "Details"
   ];
-  if (req.some(function(k){ return hMap[k] === undefined; })) return;
+  if (req.some(function(k){ return hMap[k] === undefined; })) return { sent: false, reason: 'Required columns missing from Violations sheet.', rowCount: 0, recipientCount: uniqueEmails.length };
 
   const MATCH_TEXT = "🟨 PERFORMANCE: CTR ≥ 90% & CPM ≥ $10";
   const startOfMonth = new Date(today.getFullYear(), today.getMonth(), 1);
@@ -1446,7 +1664,10 @@ function sendPerformanceSpikeAlertIfPre15() {
   });
 
   appendTodaySnapshots_(snapshots);
-  if (!candidateRows.length) { compactPerfAlertCache_(35); return; }
+  if (!candidateRows.length) {
+    compactPerfAlertCache_(35);
+    return { sent: false, reason: 'No changed/new performance alert rows matched the current data.', rowCount: 0, recipientCount: uniqueEmails.length };
+  }
 
   const htmlRows = candidateRows.map(function(o){
     return (
@@ -1474,14 +1695,16 @@ function sendPerformanceSpikeAlertIfPre15() {
     + htmlRows
     + '</table>'
     + '<br/>'
-    + '<p><i>Brought to you by Platform Solutions Automation. (Made by: BK)</i></p>';
+    + buildReplyInstructionsFooterHtml_();
 
   const todayStr = Utilities.formatDate(today, Session.getScriptTimeZone(), "M/d/yy");
   const subject = 'ALERT – PERFORMANCE (pre-monthly-summary) – ' + todayStr + ' – ' + candidateRows.length + ' changed/new row(s)';
 
+  let sentCount = 0;
   uniqueEmails.forEach(function(addr){
     try {
       MailApp.sendEmail({ to: addr, subject: subject, htmlBody: table });
+      sentCount++;
       Utilities.sleep(300);
     } catch (err) {
       Logger.log('❌ Failed to email ' + addr + ': ' + err);
@@ -1489,6 +1712,12 @@ function sendPerformanceSpikeAlertIfPre15() {
   });
 
   compactPerfAlertCache_(35);
+  return {
+    sent: sentCount > 0,
+    reason: sentCount > 0 ? '' : 'All performance alert sends failed.',
+    rowCount: candidateRows.length,
+    recipientCount: sentCount
+  };
 }
 
 
@@ -2403,7 +2632,7 @@ function sendEmailSummary() {
   sendEmailSummaryChunked_(true); // true = allow chunking
 }
 
-function sendEmailSummaryChunked_(allowChunking, skipDateCheck) {
+function sendEmailSummaryChunked_(allowChunking, skipDateCheck, overrideRecipients) {
   const startTime = Date.now();
   const isAuto = !isManualRun_();
   
@@ -2444,10 +2673,14 @@ function sendEmailSummaryChunked_(allowChunking, skipDateCheck) {
         stage: 'network_summary',
         cachedHtml: {},
         processedOwners: [],
-        allOwners: []
+        allOwners: [],
+        overrideRecipients: normalizeRecipientEmails_(overrideRecipients)
       };
       saveEmailState_(state);
       cancelEmailChunkTrigger_();
+    } else if (overrideRecipients && overrideRecipients.length) {
+      state.overrideRecipients = normalizeRecipientEmails_(overrideRecipients);
+      saveEmailState_(state);
     }
 
     const sheet = ss.getSheetByName("Violations");
@@ -2610,17 +2843,17 @@ function sendEmailSummaryChunked_(allowChunking, skipDateCheck) {
       Logger.log('📧 Email Stage 5/5: Assembling and sending email...');
       
       // Get recipients
-      const emails = recipientsSheet.getRange("A2:A").getValues()
-        .flat()
-        .map(function(e){ return String(e || "").trim(); })
-        .filter(Boolean);
-      const uniqueEmails = Array.from(new Set(emails));
+      const uniqueEmails = getRecipientEmails_(recipientsSheet, state.overrideRecipients);
       
       if (uniqueEmails.length === 0) {
         Logger.log('⚠️ No recipients found');
         clearEmailState_();
         cancelEmailChunkTrigger_();
         return;
+      }
+
+      if (state.overrideRecipients && state.overrideRecipients.length) {
+        Logger.log('📧 Test recipient override active: ' + uniqueEmails.join(', '));
       }
 
       // Assemble email
@@ -2632,35 +2865,7 @@ function sendEmailSummaryChunked_(allowChunking, skipDateCheck) {
                      (state.cachedHtml.midFlightHtml ? ('<br/>' + state.cachedHtml.midFlightHtml) : '') +
                      '<br/>' + state.cachedHtml.staleHtml +
                      '<hr/>' +
-                     '<h3>📧 How to Mark Placements as Handled:</h3>' +
-                     '<p>Reply to this email with the following format:</p>' +
-                     '<pre style="background: #f5f5f5; padding: 10px;">' +
-                     'Your note describing what was done\n' +
-                     '12345678\n' +
-                     '87654321\n' +
-                     '98765432' +
-                     '</pre>' +
-                     '<p>Handled placements will appear at the bottom of your section in future reports with a green checkmark.</p>' +
-                     '<hr/>' +
-                     '<h3>📧 To Remove a Network from Monitoring:</h3>' +
-                     '<p>Reply to this email with "REMOVE NETWORK [ID]" in the body.</p>' +
-                     '<p><b>Example (for multiple networks):</b></p>' +
-                     '<pre style="background: #f5f5f5; padding: 10px;">' +
-                     'REMOVE NETWORK 12345\n' +
-                     'REMOVE NETWORK 67890\n' +
-                     'REMOVE NETWORK 99999' +
-                     '</pre>' +
-                     '<hr/>' +
-                     '<h3>📋 How to Add a New Network Report:</h3>' +
-                     '<ol>' +
-                     '<li><b>Step 1:</b> Place this exact string into the AI helper in DCM Reports:<br/>' +
-                     '<code>Advertiser, Placement ID, Placement, Campaign, Placement Start Date, Placement End Date, Campaign Start Date, Campaign End Date, Ad, Impressions, Clicks, This Month</code></li>' +
-                     '<li><b>Step 2:</b> Set the report subject/label to exactly: <code>BKCM360 Global QA Check</code></li>' +
-                     '<li><b>Step 3:</b> Set schedule with end date of Jan 1, 2030</li>' +
-                     '<li><b>Step 4:</b> Ensure you CC this email exactly: <code>platformsolutionsadopshorizon@gmail.com</code></li>' +
-                     '</ol>' +
-                     '<hr/>' +
-                     '<p><i>Brought to you by the Platform Solutions Automation. (Made by: BK)</i></p>';
+                     buildReplyInstructionsFooterHtml_();
 
       // Safety trim
       const MAX_HTML_CHARS = 90000;
