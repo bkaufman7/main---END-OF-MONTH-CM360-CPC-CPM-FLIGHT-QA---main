@@ -10,6 +10,7 @@
 const CPC_RATE = 0.008;  // $0.008 per click ($8 per 1000 clicks)
 const CPM_RATE = 0.034;  // $0.034 per 1000 impressions (3.4 cents per 1000)
 const TEST_EMAIL_RECIPIENT = 'bkaufman@horizonmedia.com';
+const UNASSIGNED_ALERT_RECIPIENTS = ['BKaufman@horizonmedia.com'];
 
 // ---------------------
 // onOpen: Menu Setup
@@ -22,12 +23,15 @@ function onOpen() {
     .addSeparator()
     .addItem("Pull Data (Immediate)", "importDCMReports")
     .addItem("Pull Data (Auto-Resume)", "importDCMReportsChunked")
+    .addItem("Build Live Placement Pivot", "buildFilteredRawDataAndPivot")
+    .addItem("Build Filtered Raw Data + Live Placement Pivot", "pullDataAndBuildLivePlacementPivot")
     .addItem("Run QA Only (Immediate)", "runQAOnlyImmediate")
     .addItem("Run QA Only (Auto-Resume)", "runQAOnly")
     .addItem("Send Email Only (Immediate)", "sendEmailSummaryImmediate")
     .addItem("Send Email Only (Auto-Resume)", "sendEmailSummary")
     .addItem("FORCE Send Email Now", "sendEmailNow")
     .addItem("Test Send Both Emails (BK only)", "sendTestEmailsToBk")
+    .addItem("Mock Performance Email Preview (BK only)", "sendMockPerformanceEmailPreview")
     .addSeparator()
     .addItem("� Debug QA Filtering", "debugQAFiltering")
     .addItem("🔍 Count Non-Zero Rows", "countNonZeroRows")
@@ -48,10 +52,478 @@ function onOpen() {
     .addItem("💰 Show Current Month Overage", "showCurrentMonthOverage")
     .addSeparator()
     .addItem("Clear Violations", "clearViolations")
+    .addSeparator()
+    .addItem("🕰️ Historical Backfill (Pick Date)", "runHistoricalBackfill")
+    .addItem("▶ Resume Historical Backfill", "resumeHistoricalBackfill")
+    .addItem("📍 Historical Backfill Status", "showHistoricalBackfillStatus")
     .addToUi();
 }
 
+function pullDataAndBuildLivePlacementPivot() {
+  // Builds Raw Data Filtered and Live Placements Pivot from the existing Raw Data tab.
+  // Does NOT pull from Gmail — run "Pull Data" first to refresh Raw Data.
+  // suppressUiAlert: true because this function is called from a time-driven trigger
+  // and SpreadsheetApp.getUi() throws in that context.
+  buildFilteredRawDataAndPivot({ suppressUiAlert: true });
+}
 
+// Alias kept so the existing time-driven trigger for 'runQABackup' doesn't error.
+function runQABackup() {
+  runQAOnly();
+}
+
+
+
+// ---------------------
+// HISTORICAL BACKFILL — manual-only, completely separate from normal trigger workflow
+// ---------------------
+const HIST_BACKFILL_STATE_KEY = 'historical_backfill_state_v1';
+const HIST_BACKFILL_TRIGGER_KEY = 'historical_backfill_trigger_id';
+
+function runHistoricalBackfill() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const defaultDateIso = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
+    const html = HtmlService.createHtmlOutput(
+      '<!doctype html>' +
+      '<html><head><meta charset="utf-8"><style>' +
+      'body{font-family:Arial,sans-serif;padding:12px;line-height:1.4;}' +
+      'label{display:block;margin-bottom:6px;font-weight:600;}' +
+      'input[type=date]{font-size:14px;padding:6px;width:100%;box-sizing:border-box;}' +
+      '.note{font-size:12px;color:#555;margin-top:8px;}' +
+      '.actions{margin-top:14px;display:flex;gap:8px;justify-content:flex-end;}' +
+      'button{padding:6px 10px;font-size:13px;cursor:pointer;}' +
+      '#status{margin-top:10px;font-size:12px;color:#444;}' +
+      '</style></head>' +
+      '<body>' +
+      '<label for="bfDate">Select backfill date</label>' +
+      '<input id="bfDate" type="date" value="' + defaultDateIso + '" />' +
+      '<div class="note">This will overwrite Raw Data, Filtered Data, Live Placements Pivot, and Violations before sending the historical QA email.</div>' +
+      '<div class="actions">' +
+      '<button type="button" onclick="google.script.host.close()">Cancel</button>' +
+      '<button type="button" onclick="startBackfill()">Start</button>' +
+      '</div>' +
+      '<div id="status"></div>' +
+      '<script>' +
+      'function startBackfill(){' +
+      '  var el=document.getElementById("bfDate");' +
+      '  var status=document.getElementById("status");' +
+      '  if(!el.value){status.textContent="Pick a date first.";return;}' +
+      '  var ok=confirm("Start historical backfill for " + el.value + "?");' +
+      '  if(!ok){return;}' +
+      '  status.textContent="Queueing backfill...";' +
+      '  google.script.run' +
+      '    .withSuccessHandler(function(res){' +
+      '      status.textContent=(res && res.message) ? res.message : "Queued. Check Historical Backfill Status.";' +
+      '      setTimeout(function(){google.script.host.close();}, 1200);' +
+      '    })' +
+      '    .withFailureHandler(function(err){status.textContent="Error: " + (err && err.message ? err.message : err);})' +
+      '    .startHistoricalBackfillFromPicker(el.value);' +
+      '}' +
+      '</script>' +
+      '</body></html>'
+    ).setWidth(420).setHeight(280);
+
+    Logger.log('Opening Historical Backfill date picker sidebar.');
+    SpreadsheetApp.getActiveSpreadsheet().toast('Opening Historical Backfill date picker...', 'Historical Backfill', 5);
+    ui.showSidebar(html.setTitle('Historical Backfill'));
+  } catch (e) {
+    Logger.log('Failed to open date picker UI, falling back to prompt: ' + e.message);
+    runHistoricalBackfillPromptFallback_();
+  }
+}
+
+function runHistoricalBackfillPromptFallback_() {
+  const ui = SpreadsheetApp.getUi();
+  const prompt = ui.prompt(
+    'Historical Backfill (Fallback)',
+    'Enter date as YYYY-MM-DD:',
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (prompt.getSelectedButton() !== ui.Button.OK) return;
+  startHistoricalBackfillFromPicker(prompt.getResponseText());
+}
+
+function startHistoricalBackfillFromPicker(dateInput) {
+  Logger.log('Historical Backfill start requested for ' + dateInput);
+  return startHistoricalBackfillFromPicker_(dateInput);
+}
+
+function startHistoricalBackfillFromPicker_(dateInput) {
+  const m = String(dateInput || '').trim().match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) {
+    throw new Error('Invalid date selection. Please pick a date from the calendar.');
+  }
+
+  const year = Number(m[1]);
+  const month = Number(m[2]);
+  const day = Number(m[3]);
+  const targetDate = new Date(year, month - 1, day);
+  if (isNaN(targetDate.getTime())) {
+    throw new Error('Invalid date. Please try again.');
+  }
+
+  const dateStr = Utilities.formatDate(targetDate, Session.getScriptTimeZone(), "M/d/yy");
+
+  clearHistoricalBackfillState_();
+  cancelHistoricalBackfillTrigger_();
+
+  saveHistoricalBackfillState_({
+    session: String(Date.now()),
+    targetDateIso: targetDate.toISOString(),
+    dateStr: dateStr,
+    stage: 'import',
+    qaStarted: false,
+    startedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    error: ''
+  });
+
+  // Queue asynchronous execution so the sidebar call returns immediately.
+  scheduleHistoricalBackfillNextChunk_(1);
+  return {
+    ok: true,
+    dateStr: dateStr,
+    message: 'Backfill queued for ' + dateStr + '. It will auto-resume until complete.'
+  };
+}
+
+function showHistoricalBackfillStatus() {
+  const ui = SpreadsheetApp.getUi();
+  const state = getHistoricalBackfillState_();
+  const qaState = getQAState_();
+
+  if (!state) {
+    ui.alert('Historical backfill status', 'No historical backfill is currently in progress.', ui.ButtonSet.OK);
+    return;
+  }
+
+  const lines = [
+    'Date: ' + (state.dateStr || state.targetDateIso || 'Unknown'),
+    'Stage: ' + (state.stage || 'Unknown'),
+    'Last Updated: ' + (state.updatedAt || 'Unknown'),
+    'Started: ' + (state.startedAt || 'Unknown'),
+    'QA Running: ' + ((qaState && qaState.session) ? 'Yes' : 'No')
+  ];
+
+  if (state.error) lines.push('Last Error: ' + state.error);
+
+  ui.alert('Historical backfill status', lines.join('\n'), ui.ButtonSet.OK);
+}
+
+function resumeHistoricalBackfill() {
+  const state = getHistoricalBackfillState_();
+  if (!state) {
+    SpreadsheetApp.getUi().alert('No historical backfill is currently in progress.');
+    return;
+  }
+  executeHistoricalBackfill();
+}
+
+function executeHistoricalBackfill() {
+  Logger.log('Historical Backfill executor invoked.');
+  return executeHistoricalBackfill_({ startedByMenu: false });
+}
+
+function executeHistoricalBackfill_(_opts) {
+  const dlock = LockService.getDocumentLock();
+  if (!dlock.tryLock(5000)) {
+    Logger.log('⏳ Historical Backfill lock busy; rescheduling.');
+    scheduleHistoricalBackfillNextChunk_(2);
+    return;
+  }
+
+  cancelHistoricalBackfillTrigger_();
+
+  try {
+    const state = getHistoricalBackfillState_();
+    if (!state || !state.targetDateIso) {
+      Logger.log('ℹ️ Historical Backfill: no active state found. Nothing to do.');
+      return;
+    }
+
+    // Backward compatibility for states created before qaStarted existed.
+    if (state.stage === 'qa' && typeof state.qaStarted === 'undefined') {
+      state.qaStarted = true;
+      state.updatedAt = new Date().toISOString();
+      saveHistoricalBackfillState_(state);
+    }
+
+    const targetDate = new Date(state.targetDateIso);
+    if (isNaN(targetDate.getTime())) {
+      throw new Error('Historical backfill state has an invalid target date.');
+    }
+
+    Logger.log('🕰️ Historical Backfill stage: ' + state.stage + ' [' + (state.dateStr || state.targetDateIso) + ']');
+
+    if (state.stage === 'import') {
+      Logger.log('▶ Step 1: importDCMReportsForDate_');
+      importDCMReportsForDate_(targetDate);
+      state.stage = 'build';
+      state.updatedAt = new Date().toISOString();
+      saveHistoricalBackfillState_(state);
+    }
+
+    if (state.stage === 'build') {
+      Logger.log('▶ Step 2: buildFilteredRawDataAndPivot (overrideDate)');
+      buildFilteredRawDataAndPivot({ suppressUiAlert: true, overrideDate: targetDate });
+      state.stage = 'qa';
+      state.updatedAt = new Date().toISOString();
+      saveHistoricalBackfillState_(state);
+    }
+
+    if (state.stage === 'qa') {
+      const qaState = getQAState_();
+      if (qaState && qaState.session) {
+        state.stage = 'qa';
+        state.updatedAt = new Date().toISOString();
+        saveHistoricalBackfillState_(state);
+        scheduleHistoricalBackfillNextChunk_(2);
+        Logger.log('⏳ Historical Backfill waiting for QA completion; will resume automatically.');
+        return;
+      }
+
+      // If QA was already started in a previous run and no QA state remains,
+      // QA has completed and we can proceed directly to email.
+      if (state.qaStarted) {
+        Logger.log('✅ Historical Backfill: QA is complete; advancing to email stage.');
+      } else {
+        Logger.log('▶ Step 3: runQAOnly (chunked auto-resume, overrideDate)');
+        runQAOnly({ overrideDate: targetDate });
+        state.qaStarted = true;
+
+        // Re-check immediately after starting QA.
+        const qaStateAfter = getQAState_();
+        if (qaStateAfter && qaStateAfter.session) {
+          state.stage = 'qa';
+          state.updatedAt = new Date().toISOString();
+          saveHistoricalBackfillState_(state);
+          scheduleHistoricalBackfillNextChunk_(2);
+          Logger.log('⏳ Historical Backfill waiting for QA completion; will resume automatically.');
+          return;
+        }
+      }
+
+      state.stage = 'email';
+      state.updatedAt = new Date().toISOString();
+      saveHistoricalBackfillState_(state);
+    }
+
+    if (state.stage === 'email') {
+      Logger.log('▶ Step 4: sendHistoricalEmailSummary_');
+      sendHistoricalEmailSummary_(targetDate);
+      state.stage = 'done';
+      state.finishedAt = new Date().toISOString();
+      state.updatedAt = new Date().toISOString();
+      saveHistoricalBackfillState_(state);
+    }
+
+    if (state.stage === 'done') {
+      Logger.log('✅ Historical Backfill COMPLETE — ' + (state.dateStr || state.targetDateIso));
+      clearHistoricalBackfillState_();
+      cancelHistoricalBackfillTrigger_();
+      return;
+    }
+
+    // Safety net: if a future stage is introduced, continue automatically.
+    scheduleHistoricalBackfillNextChunk_(2);
+  } catch (e) {
+    const state = getHistoricalBackfillState_() || {};
+    state.error = e.message;
+    state.updatedAt = new Date().toISOString();
+    saveHistoricalBackfillState_(state);
+    scheduleHistoricalBackfillNextChunk_(5);
+    Logger.log('❌ Historical Backfill FAILED (will retry): ' + e.message + '\n' + (e.stack || ''));
+    throw e;
+  } finally {
+    dlock.releaseLock();
+  }
+}
+
+function getHistoricalBackfillState_() {
+  const raw = PropertiesService.getDocumentProperties().getProperty(HIST_BACKFILL_STATE_KEY);
+  return raw ? JSON.parse(raw) : null;
+}
+
+function saveHistoricalBackfillState_(obj) {
+  PropertiesService.getDocumentProperties().setProperty(HIST_BACKFILL_STATE_KEY, JSON.stringify(obj));
+}
+
+function clearHistoricalBackfillState_() {
+  PropertiesService.getDocumentProperties().deleteProperty(HIST_BACKFILL_STATE_KEY);
+}
+
+function scheduleHistoricalBackfillNextChunk_(minutesFromNow) {
+  minutesFromNow = Math.max(1, Math.min(10, Math.floor(minutesFromNow || 2)));
+  const props = getScriptProps_();
+
+  const existingId = props.getProperty(HIST_BACKFILL_TRIGGER_KEY);
+  if (existingId) {
+    ScriptApp.getProjectTriggers().forEach(function(t){
+      if (t.getUniqueId() === existingId) ScriptApp.deleteTrigger(t);
+    });
+    props.deleteProperty(HIST_BACKFILL_TRIGGER_KEY);
+  }
+
+  const trig = ScriptApp
+    .newTrigger('executeHistoricalBackfill')
+    .timeBased()
+    .after(minutesFromNow * 60 * 1000)
+    .create();
+
+  props.setProperty(HIST_BACKFILL_TRIGGER_KEY, trig.getUniqueId());
+}
+
+function cancelHistoricalBackfillTrigger_() {
+  const props = getScriptProps_();
+  const id = props.getProperty(HIST_BACKFILL_TRIGGER_KEY);
+  if (!id) return;
+  ScriptApp.getProjectTriggers().forEach(function(t){
+    if (t.getUniqueId() === id) ScriptApp.deleteTrigger(t);
+  });
+  props.deleteProperty(HIST_BACKFILL_TRIGGER_KEY);
+}
+
+function importDCMReportsForDate_(targetDate) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const removedNetworks = getRemovedNetworks(ss);
+  const dataSheet = ss.getSheetByName("Raw Data") || ss.insertSheet("Raw Data");
+  const dataHeaders = [
+    "Network ID","Advertiser","Placement ID","Placement","Campaign",
+    "Placement Start Date","Placement End Date","Campaign Start Date","Campaign End Date",
+    "Ad","Impressions","Clicks","Report Date"
+  ];
+  dataSheet.clearContents().getRange(1, 1, 1, dataHeaders.length).setValues([dataHeaders]);
+
+  const outputSheet = ss.getSheetByName("Violations");
+  if (outputSheet) {
+    const outputHeaders = [
+      "Network ID","Report Date","Advertiser","Campaign","Campaign Start Date","Campaign End Date",
+      "Ad","Placement ID","Placement","Placement Start Date","Placement End Date",
+      "Impressions","Clicks","CTR (%)","Days Until Placement End","Flight Completion %",
+      "Days Left in the Month","CPC Risk","$CPC","$CPM","Issue Type","Details",
+      "Last Imp Change","Last Click Change","Owner (Ops)"
+    ];
+    outputSheet.clearContents().getRange(1, 1, 1, outputHeaders.length).setValues([outputHeaders]);
+  }
+
+  const tz = Session.getScriptTimeZone();
+  const afterStr      = Utilities.formatDate(targetDate, tz, "yyyy/MM/dd");
+  const nextDay       = new Date(targetDate.getTime() + 86400000);
+  const beforeStr     = Utilities.formatDate(nextDay, tz, "yyyy/MM/dd");
+  const reportDateStr = Utilities.formatDate(targetDate, tz, "yyyy-MM-dd");
+
+  const threads = GmailApp.search('label:CM360 QA after:' + afterStr + ' before:' + beforeStr);
+  Logger.log('🕰️ importDCMReportsForDate_: ' + threads.length + ' thread(s) found for ' + afterStr);
+
+  let extractedData = [];
+  threads.forEach(function(thread) {
+    thread.getMessages().forEach(function(message) {
+      message.getAttachments().forEach(function(att) {
+        const netId = extractNetworkId(att.getName());
+        if (removedNetworks.has(netId)) { Logger.log('Skipping removed network: ' + netId); return; }
+        if (att.getContentType() === 'text/csv' || att.getName().endsWith('.csv')) {
+          extractedData = extractedData.concat(processCSVForDate_(att.getDataAsString(), netId, reportDateStr));
+        } else if (att.getContentType() === 'application/zip') {
+          Utilities.unzip(att.copyBlob()).forEach(function(file) {
+            const nestedNetId = extractNetworkId(file.getName());
+            if (removedNetworks.has(nestedNetId)) return;
+            if (file.getContentType() === 'text/csv' || file.getName().endsWith('.csv')) {
+              extractedData = extractedData.concat(processCSVForDate_(file.getDataAsString(), nestedNetId, reportDateStr));
+            }
+          });
+        }
+      });
+    });
+  });
+
+  if (extractedData.length) {
+    dataSheet.getRange(2, 1, extractedData.length, dataHeaders.length).setValues(extractedData);
+  }
+  Logger.log('🕰️ importDCMReportsForDate_: ' + extractedData.length + ' rows imported for ' + afterStr);
+}
+
+function processCSVForDate_(fileContent, networkId, reportDateStr) {
+  const lines = fileContent.split('\n').map(function(l) { return l.trim(); }).filter(Boolean);
+  const startIndex = lines.findIndex(function(l) { return l.startsWith('Advertiser'); });
+  if (startIndex === -1) return [];
+  const csvData = Utilities.parseCsv(lines.slice(startIndex).join('\n'));
+  csvData.shift();
+  return csvData.map(function(row) { return [networkId].concat(row).concat([reportDateStr]); });
+}
+
+function sendHistoricalEmailSummary_(targetDate) {
+  const ss              = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet           = ss.getSheetByName('Violations');
+  const rawSheet        = ss.getSheetByName('Raw Data');
+  const networksSheet   = ss.getSheetByName('Networks');
+  const recipientsSheet = ss.getSheetByName('EMAIL LIST');
+
+  if (!sheet || !rawSheet || !recipientsSheet) {
+    throw new Error('Required sheets missing (Violations, Raw Data, or EMAIL LIST).');
+  }
+
+  const violations = sheet.getDataRange().getValues();
+  const rawData    = rawSheet.getDataRange().getValues();
+
+  if (violations.length <= 1) {
+    Logger.log('⚠️ sendHistoricalEmailSummary_: No violations found — email not sent.');
+    return;
+  }
+
+  const tz          = Session.getScriptTimeZone();
+  const dateLabel   = Utilities.formatDate(targetDate, tz, 'M/d/yy');
+  const dateForFile = Utilities.formatDate(targetDate, tz, 'M.d.yy');
+
+  Logger.log('📧 Historical email: building HTML sections for ' + dateLabel + '...');
+  const networkSummary = buildNetworkSummaryHtml_(violations, rawData, networksSheet);
+  const groupedSummary = buildGroupedSummaryHtml_(violations);
+  const staleHtml      = buildStaleHtml_(violations);
+  const ownerData      = buildImmediateAttentionData_(violations);
+  const immediateHtml  = ownerData.owners.length > 0
+    ? '<p><b>Immediate Attention \u2014 Key Issues (by Owner)</b></p>' +
+      buildImmediateAttentionHtmlForOwners_(ownerData.owners, ownerData.perOwner)
+    : '';
+
+  const subject = 'CM360 CPC/CPM FLIGHT QA \u2013 ' + dateLabel + ' [Historical Backfill]';
+  let htmlBody = networkSummary +
+    '<p style="font-size:11px;">The below is a table of the following Billing, Delivery, Performance and Cost issues:</p>' +
+    '<div style="font-size:11px;">' + groupedSummary + '</div>' +
+    (immediateHtml ? '<br/>' + immediateHtml : '') +
+    '<br/>' + staleHtml +
+    '<hr/>' +
+    buildReplyInstructionsFooterHtml_();
+
+  const MAX_HTML_CHARS = 90000;
+  if (htmlBody.length > MAX_HTML_CHARS) {
+    htmlBody = htmlBody.slice(0, MAX_HTML_CHARS - 1200) +
+      '<p><i>(trimmed for size — full detail in the attached XLSX)</i></p>';
+  }
+
+  const fileName = 'CM360_QA_Violations_' + dateForFile + '_backfill.xlsx';
+  const xlsxBlob = createXLSXFromSheet(sheet).setName(fileName);
+  const tempFile = DriveApp.createFile(xlsxBlob);
+
+  const uniqueEmails = getRecipientEmails_(recipientsSheet, null);
+  let sentCount = 0;
+  uniqueEmails.forEach(function(addr) {
+    try {
+      MailApp.sendEmail({
+        to: addr,
+        subject: subject,
+        htmlBody: htmlBody,
+        attachments: [tempFile.getBlob().setName(fileName)]
+      });
+      sentCount++;
+      Utilities.sleep(300);
+    } catch (err) {
+      Logger.log('❌ sendHistoricalEmailSummary_: failed to email ' + addr + ': ' + err);
+    }
+  });
+
+  try { tempFile.setTrashed(true); } catch (e) { /* noop */ }
+  Logger.log('✅ sendHistoricalEmailSummary_: sent to ' + sentCount + '/' + uniqueEmails.length + ' recipients');
+}
 
 // ---------------------
 // one-time MailApp authorization helper
@@ -106,6 +578,74 @@ function sendTestEmailsToBk() {
     + 'Monthly summary is being sent only to ' + TEST_EMAIL_RECIPIENT + '.\n'
     + 'If the summary needs to auto-resume, the follow-up chunks will keep using the BK-only recipient override.'
   );
+}
+
+function sendMockPerformanceEmailPreview() {
+  const ui = SpreadsheetApp.getUi();
+  const today = new Date();
+  const todayStr = Utilities.formatDate(today, Session.getScriptTimeZone(), "M/d/yy");
+
+  const mockRows = [
+    {
+      netId: '1234567',
+      adv: 'Sample Advertiser A',
+      camp: 'Q2 Brand Awareness - East',
+      pid: '99887766',
+      plc: 'Homepage Billboard 300x250',
+      imp: 125000,
+      clk: 113500,
+      det: 'CTR 90.8%, CPM $12.20 (mock preview row)'
+    },
+    {
+      netId: '7654321',
+      adv: 'Sample Advertiser B',
+      camp: 'Prospecting - Video - April',
+      pid: '88776655',
+      plc: 'In-stream 15s Pre-roll',
+      imp: 84200,
+      clk: 76110,
+      det: 'CTR 90.4%, CPM $10.75 (mock preview row)'
+    }
+  ];
+
+  const htmlRows = mockRows.map(function(o) {
+    return (
+      '<tr>' +
+      '<td>' + o.netId + '</td>' +
+      '<td>' + o.adv + '</td>' +
+      '<td>' + o.camp + '</td>' +
+      '<td>' + o.pid + '</td>' +
+      '<td>' + o.plc + '</td>' +
+      '<td>' + o.imp + '</td>' +
+      '<td>' + o.clk + '</td>' +
+      '<td>' + o.det + '</td>' +
+      '</tr>'
+    );
+  }).join('');
+
+  const htmlBody = ''
+    + '<p><b>ALERT:</b> 🟨 PERFORMANCE: CTR ≥ 90% & CPM ≥ $10</p>'
+    + '<p><i>Mock preview email for formatting validation. This is not sourced from live data.</i></p>'
+    + '<p>This report lists placements that continue to meet the performance-alert criteria. Items drop off once metrics are corrected or fall below the thresholds, but will continue to be listed within the CM360 CPC/CPM FLIGHT QA reports.</p>'
+    + '<table border="1" cellpadding="4" cellspacing="0" style="border-collapse:collapse;font-size:11px;">'
+    + '<tr style="background:#f2f2f2;font-weight:bold;">'
+    + '<th>Network ID</th><th>Advertiser</th><th>Campaign</th><th>Placement ID</th>'
+    + '<th>Placement</th><th>Impressions</th><th>Clicks</th><th>Details</th>'
+    + '</tr>'
+    + htmlRows
+    + '</table>'
+    + '<br/>'
+    + buildReplyInstructionsFooterHtml_();
+
+  const subject = 'MOCK PREVIEW – ALERT – PERFORMANCE (pre-monthly-summary) – ' + todayStr + ' – ' + mockRows.length + ' row(s)';
+
+  MailApp.sendEmail({
+    to: TEST_EMAIL_RECIPIENT,
+    subject: subject,
+    htmlBody: htmlBody
+  });
+
+  ui.alert('Mock performance preview sent to ' + TEST_EMAIL_RECIPIENT + '.');
 }
 
 // ---------------------
@@ -219,8 +759,8 @@ function processEmailReplies() {
   let recipientsAddedCount = 0;
   let errorCount = 0;
   
-  // Track which messages we've already processed (by message ID) to prevent duplicates
-  const processedMessageIds = {};
+  // Track which messages we've already processed (by message ID) across runs
+  const processedMessageIds = getProcessedReplyMessageIds_();
   
   threads.forEach(function(thread) {
     const messages = thread.getMessages();
@@ -247,12 +787,17 @@ function processEmailReplies() {
       
       // Parse the email body
       const parseResult = parseReplyEmail_(body);
+
+      if (parseResult.shouldIgnore) {
+        processedMessageIds[messageId] = Date.now();
+        return;
+      }
       
       if (parseResult.error) {
         Logger.log("❌ Parse error from " + sender + ": " + parseResult.error);
         sendReplyErrorEmail_(sender, parseResult.error);
         errorCount++;
-          processedMessageIds[messageId] = true; // Mark as processed even on error
+          processedMessageIds[messageId] = Date.now(); // Mark as processed even on error
         return;
       }
       
@@ -261,7 +806,7 @@ function processEmailReplies() {
         const removed = removeNetworks_(parseResult.networkIds, sender);
         networksRemovedCount += removed;
         Logger.log("🗑️ " + sender + " removed " + removed + " network(s): " + parseResult.networkIds.join(", "));
-        processedMessageIds[messageId] = true;
+        processedMessageIds[messageId] = Date.now();
         return;
       }
 
@@ -270,31 +815,37 @@ function processEmailReplies() {
         const recipientResult = addRecipientsFromReply_(parseResult.recipientEmails, sender, messageDate);
         recipientsAddedCount += recipientResult.added.length;
         Logger.log("📬 " + sender + " add recipient request: added=" + recipientResult.added.length + ", duplicates=" + recipientResult.duplicates.length + ", invalidDomain=" + recipientResult.invalidDomain.length);
-        processedMessageIds[messageId] = true;
+        processedMessageIds[messageId] = Date.now();
         return;
       }
       
-      // Handle placement notes
+      // Handle placement notes (supports multiple blocks with different notes)
       if (parseResult.type === 'HANDLE_PLACEMENT' && parseResult.placementIds.length > 0) {
-        const result = storeHandledPlacements_(
-          parseResult.placementIds,
-          parseResult.note,
-          sender,
-          messageDate,
-          violationsSheet,
-          handledSheet
-        );
-        
-        processedCount += result.stored;
-        
-        if (result.invalid.length > 0) {
-          Logger.log("⚠️ Invalid placement IDs from " + sender + ": " + result.invalid.join(", "));
-        }
+        const blocks = parseResult.placementBlocks && parseResult.placementBlocks.length > 0
+          ? parseResult.placementBlocks
+          : [{ note: parseResult.note, placementIds: parseResult.placementIds }];
 
-        processedMessageIds[messageId] = true;
+        blocks.forEach(function(block) {
+          const result = storeHandledPlacements_(
+            block.placementIds,
+            block.note,
+            sender,
+            messageDate,
+            violationsSheet,
+            handledSheet
+          );
+          processedCount += result.stored;
+          if (result.invalid.length > 0) {
+            Logger.log("⚠️ Invalid placement IDs from " + sender + ": " + result.invalid.join(", "));
+          }
+        });
+
+        processedMessageIds[messageId] = Date.now();
       }
     });
   });
+
+  saveProcessedReplyMessageIds_(processedMessageIds);
   
   Logger.log("✅ Processed " + processedCount + " placement notes from email replies");
   if (networksRemovedCount > 0) {
@@ -308,7 +859,51 @@ function processEmailReplies() {
   }
 }
 
+function getProcessedReplyMessageIds_() {
+  const raw = PropertiesService.getDocumentProperties().getProperty('reply_processed_message_ids_v1');
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch (e) {
+    return {};
+  }
+}
+
+function saveProcessedReplyMessageIds_(processedMap) {
+  const map = processedMap || {};
+  const keys = Object.keys(map);
+
+  // Keep only the newest 5000 processed IDs so the property doesn't grow unbounded.
+  if (keys.length > 5000) {
+    keys.sort(function(a, b) {
+      return Number(map[b] || 0) - Number(map[a] || 0);
+    });
+    const trimmed = {};
+    for (let i = 0; i < 5000; i++) {
+      trimmed[keys[i]] = map[keys[i]];
+    }
+    PropertiesService.getDocumentProperties().setProperty('reply_processed_message_ids_v1', JSON.stringify(trimmed));
+    return;
+  }
+
+  PropertiesService.getDocumentProperties().setProperty('reply_processed_message_ids_v1', JSON.stringify(map));
+}
+
 // ---------------------
+// Helper function to strip formatting characters (hidden Unicode, zero-width chars, etc.)
+// This handles text copied from formatted emails that contain invisible formatting artifacts
+function stripFormattingChars_(text) {
+  if (!text) return text;
+  // Remove zero-width spaces, directional marks, and other invisible Unicode formatting
+  return text
+    .replace(/[\u200B\u200C\u200D\u200E\u200F\uFEFF]/g, '') // Zero-width chars, directional marks, BOM
+    .replace(/[\u202A-\u202E]/g, '')  // Directional formatting characters
+    .replace(/[\u061C]/g, '')         // Arabic letter mark
+    .replace(/[\u180E]/g, '')         // Mongolian vowel separator
+    .replace(/[\u2060\u2061\u2062\u2063]/g, ''); // Invisible operators and separators
+}
+
 // parseReplyEmail_ - Extract note and placement IDs from email body
 // ---------------------
 function parseReplyEmail_(body) {
@@ -322,7 +917,7 @@ function parseReplyEmail_(body) {
     'Sent from'
   ];
   
-  let cleanBody = body;
+  let cleanBody = stripFormattingChars_(body);
   
   // Find earliest stop marker
   let stopIndex = cleanBody.length;
@@ -351,7 +946,26 @@ function parseReplyEmail_(body) {
   }
   
   if (relevantLines.length === 0) {
-    return { error: null, note: null, placementIds: [], networkIds: [], recipientEmails: [], type: null };
+    return { error: null, note: null, placementIds: [], networkIds: [], recipientEmails: [], type: null, shouldIgnore: true };
+  }
+
+  const normalizedRelevantBody = relevantLines.join('\n').toLowerCase();
+  const hasDigitContent = /\d/.test(normalizedRelevantBody);
+  const hasCommandKeyword = /(remove\s+network|add\s+recipient)/i.test(normalizedRelevantBody);
+  const looksLikeAutoReply = /(automatic reply|auto-?reply|out of office|out-of-office|ooo|vacation)/i.test(normalizedRelevantBody);
+
+  // Ignore obvious non-action messages (for example OOO or quick acknowledgements with no IDs).
+  if (!hasDigitContent && !hasCommandKeyword) {
+    return {
+      error: null,
+      note: null,
+      placementIds: [],
+      networkIds: [],
+      recipientEmails: [],
+      type: null,
+      shouldIgnore: true,
+      ignoreReason: looksLikeAutoReply ? 'auto-reply' : 'non-actionable'
+    };
   }
   
   // Check if this is a REMOVE NETWORK command
@@ -396,32 +1010,67 @@ function parseReplyEmail_(body) {
     };
   }
   
-  // Otherwise, parse as placement handling (note first, then placement IDs)
-  const note = relevantLines[0];
-  
-  // Rest should be placement IDs
-  const placementIds = [];
-  for (let i = 1; i < relevantLines.length; i++) {
-    const line = relevantLines[i].trim();
-    // Check if it's a number
-    if (/^\d+$/.test(line)) {
-      placementIds.push(line);
+  // Parse as placement handling — supports multiple blocks separated by blank lines.
+  // Each block: first line is the note, remaining lines are placement IDs.
+  // Example:
+  //   Note for first group
+  //   12345678
+  //   87654321
+  //
+  //   Different note for second group
+  //   11112222
+  //   33334444
+
+  // Re-split preserving blank lines so we can detect block boundaries.
+  // relevantLines already stripped quoted content; rebuild with blanks from cleanBody.
+  const allLines = cleanBody.split('\n');
+  const blocksRaw = [];
+  let currentBlock = [];
+  for (let i = 0; i < allLines.length; i++) {
+    const line = allLines[i].trim();
+    if (line.startsWith('>') || (line.startsWith('On ') && line.includes('wrote:'))) break;
+    if (line === '') {
+      if (currentBlock.length > 0) {
+        blocksRaw.push(currentBlock);
+        currentBlock = [];
+      }
+    } else {
+      currentBlock.push(line);
     }
   }
-  
-  // Validation: must have both note and at least one placement ID
-  if (placementIds.length === 0) {
+  if (currentBlock.length > 0) blocksRaw.push(currentBlock);
+
+  // Each block: first line = note, rest = placement IDs
+  const placementBlocks = []; // [{ note, placementIds }]
+  for (let b = 0; b < blocksRaw.length; b++) {
+    const block = blocksRaw[b];
+    const blockNote = block[0];
+    const blockIds = [];
+    for (let i = 1; i < block.length; i++) {
+      const cleanedLine = stripFormattingChars_(block[i]).trim();
+      if (/^\d+$/.test(cleanedLine)) blockIds.push(cleanedLine);
+    }
+    if (blockIds.length > 0) {
+      placementBlocks.push({ note: blockNote, placementIds: blockIds });
+    }
+  }
+
+  if (placementBlocks.length === 0) {
     return { 
-      error: "No placement IDs found. Please format your reply as:\n\nYour note here\n12345678\n87654321\n\nwhere the first line is your note and subsequent lines are placement IDs.",
+      error: "No placement IDs found. Please format your reply as:\n\nYour note here\n12345678\n87654321\n\nFor different notes per group, separate blocks with a blank line:\n\nFirst note\n12345678\n\nSecond note\n87654321",
       note: null,
       placementIds: [],
       networkIds: [],
       recipientEmails: [],
-      type: null
+      type: null,
+      shouldIgnore: false
     };
   }
-  
-  return { error: null, type: 'HANDLE_PLACEMENT', note: note, placementIds: placementIds, networkIds: [], recipientEmails: [] };
+
+  // Flatten all placement IDs for backward-compat; store blocks for multi-note support
+  const allPlacementIds = placementBlocks.reduce(function(acc, b) { return acc.concat(b.placementIds); }, []);
+
+  return { error: null, type: 'HANDLE_PLACEMENT', note: placementBlocks[0].note, placementIds: allPlacementIds, placementBlocks: placementBlocks, networkIds: [], recipientEmails: [], shouldIgnore: false };
 }
 
 // ---------------------
@@ -551,39 +1200,72 @@ function getOrCreateMonitoredNetworks_() {
 }
 
 // ---------------------
-// syncMonitoredNetworks_ - Auto-add new networks from Raw Data
+// syncMonitoredNetworks_ - Auto-add new networks from Raw Data + Networks
 // ---------------------
 function syncMonitoredNetworks_() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const rawSheet = ss.getSheetByName("Raw Data");
-  if (!rawSheet || rawSheet.getLastRow() <= 1) return;
-  
   const monitoredSheet = getOrCreateMonitoredNetworks_();
-  const rawData = rawSheet.getDataRange().getValues();
-  const rHeaders = rawData[0];
-  const netIdCol = rHeaders.indexOf("Network ID");
-  
+
   // Get existing monitored networks
   const monitoredData = monitoredSheet.getDataRange().getValues();
   const existingIds = {};
   for (let i = 1; i < monitoredData.length; i++) {
-    const id = String(monitoredData[i][0] || "").trim();
+    const id = normalizeNetworkId_(monitoredData[i][0]);
     if (id) existingIds[id] = true;
   }
-  
-  // Find new network IDs
-  const newNetworks = {};
-  for (let i = 1; i < rawData.length; i++) {
-    const netId = String(rawData[i][netIdCol] || "").trim();
-    if (netId && !existingIds[netId] && !newNetworks[netId]) {
-      newNetworks[netId] = true;
+
+  const newNetworkNames = {};
+
+  // Source 1: Raw Data network IDs seen in imported files
+  if (rawSheet && rawSheet.getLastRow() > 1) {
+    const rawData = rawSheet.getDataRange().getValues();
+    const rHeaders = rawData[0];
+    const netIdCol = rHeaders.indexOf("Network ID");
+
+    if (netIdCol !== -1) {
+      for (let i = 1; i < rawData.length; i++) {
+        const netId = normalizeNetworkId_(rawData[i][netIdCol]);
+        if (netId && !existingIds[netId] && !newNetworkNames[netId]) {
+          newNetworkNames[netId] = "TO BE ADDED";
+        }
+      }
     }
   }
-  
+
+  // Source 2: Networks tab (single source of truth for names/mappings)
+  const networksSheet = ss.getSheetByName("Networks");
+  if (networksSheet && networksSheet.getLastRow() > 1) {
+    const vals = networksSheet.getDataRange().getValues();
+    const hdr = vals[0].map(function(h){ return String(h || "").trim().toLowerCase(); });
+
+    function findIdx_(cands) {
+      for (let i = 0; i < cands.length; i++) {
+        const idx = hdr.indexOf(cands[i]);
+        if (idx !== -1) return idx;
+      }
+      return -1;
+    }
+
+    const idIdx = findIdx_(["network id", "network_id", "networkid", "cm360 network id"]);
+    let nameIdx = findIdx_(["network name", "network", "name", "friendly name"]);
+    if (nameIdx === -1 && vals[0].length >= 2) nameIdx = 1;
+
+    if (idIdx !== -1) {
+      for (let r = 1; r < vals.length; r++) {
+        const netId = normalizeNetworkId_(vals[r][idIdx]);
+        if (!netId || existingIds[netId]) continue;
+
+        const netName = nameIdx !== -1 ? String(vals[r][nameIdx] || "").trim() : "";
+        newNetworkNames[netId] = netName || newNetworkNames[netId] || "TO BE ADDED";
+      }
+    }
+  }
+
   // Add new networks
   const today = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd");
-  Object.keys(newNetworks).forEach(function(netId) {
-    monitoredSheet.appendRow([netId, "TO BE ADDED", today]);
+  Object.keys(newNetworkNames).forEach(function(netId) {
+    monitoredSheet.appendRow([netId, newNetworkNames[netId], today]);
     Logger.log("📋 Auto-added network " + netId + " to monitoring");
   });
 }
@@ -597,7 +1279,7 @@ function getMonitoredNetworkIds_() {
   const ids = [];
   
   for (let i = 1; i < data.length; i++) {
-    const id = String(data[i][0] || "").trim();
+    const id = normalizeNetworkId_(data[i][0]);
     if (id) ids.push(id);
   }
   
@@ -610,12 +1292,13 @@ function getMonitoredNetworkIds_() {
 function removeNetworks_(networkIds, sender) {
   const sheet = getOrCreateMonitoredNetworks_();
   const data = sheet.getDataRange().getValues();
+  const normalizedTargets = (networkIds || []).map(function(id) { return normalizeNetworkId_(id); });
   
   let removed = 0;
   // Go backwards to avoid index shifting
   for (let i = data.length - 1; i >= 1; i--) {
-    const id = String(data[i][0] || "").trim();
-    if (networkIds.indexOf(id) !== -1) {
+    const id = normalizeNetworkId_(data[i][0]);
+    if (normalizedTargets.indexOf(id) !== -1) {
       sheet.deleteRow(i + 1);
       removed++;
       Logger.log("🗑️ Removed network " + id + " (requested by " + sender + ")");
@@ -650,12 +1333,16 @@ function sendReplyErrorEmail_(recipient, errorMessage) {
     + 'Your note describing what was done\n'
     + '12345678\n'
     + '87654321\n'
-    + '98765432'
+    + '\n'
+    + 'Different note for a second group\n'
+    + '11112222\n'
+    + '33334444'
     + '</pre>'
     + '<p><b>Important:</b></p>'
     + '<ul>'
-    + '<li>First line should be your note (e.g., "Handled by digital", "Addressed with billing team")</li>'
-    + '<li>Following lines should be placement IDs, one per line</li>'
+    + '<li>First line of each block is your note (e.g., "Handled by digital", "Addressed with billing team")</li>'
+    + '<li>Following lines in each block are placement IDs, one per line</li>'
+    + '<li>Separate blocks with a blank line to assign different notes to different placements</li>'
     + '<li>Only include placement IDs that are currently in the violations report</li>'
     + '</ul>'
     + '<p>Please reply again with the correct format.</p>'
@@ -685,8 +1372,12 @@ function buildReplyInstructionsFooterHtml_() {
     + 'Your note describing what was done\n'
     + '12345678\n'
     + '87654321\n'
-    + '98765432'
+    + '\n'
+    + 'Different note for a second group\n'
+    + '11112222\n'
+    + '33334444'
     + '</pre>'
+    + '<p>Each block (separated by a blank line) can have its own note — all placement IDs in a block will be tagged with that block\'s note.</p>'
     + '<p>Handled placements will appear at the bottom of your section in future reports with a green checkmark.</p>'
     + '<hr/>'
     + '<h3>📧 To Remove a Network from Monitoring:</h3>'
@@ -703,10 +1394,11 @@ function buildReplyInstructionsFooterHtml_() {
     + '<p><b>Only email addresses ending in @horizonmedia.com will be accepted through email replies.</b></p>'
     + '<p><b>Example (for multiple recipients):</b></p>'
     + '<pre style="background: #f5f5f5; padding: 10px;">'
-    + 'ADD RECIPIENT jane.doe@horizonmedia.com\n'
-    + 'ADD RECIPIENT john.smith@horizonmedia.com\n'
-    + 'ADD RECIPIENT teamlead@horizonmedia.com'
+    + 'EXAMPLE: ADD RECIPIENT first.last@horizonmedia.com\n'
+    + 'EXAMPLE: ADD RECIPIENT team.alias@horizonmedia.com\n'
+    + 'EXAMPLE: ADD RECIPIENT owner.name@horizonmedia.com'
     + '</pre>'
+    + '<p><i>Tip: delete "EXAMPLE:" when sending a real add request.</i></p>'
     + '<p>Approved addresses will be added to the next available row in the EMAIL LIST sheet and included in future report sends.</p>'
     + '<hr/>'
     + '<h3>📋 How to Add a New Network Report:</h3>'
@@ -908,9 +1600,8 @@ function processNetworkRemovalRequests() {
         while ((match = regex.exec(body)) !== null) {
           const networkId = match[1];
           
-          // Skip example network IDs used in email instructions
+          // Skip example network IDs used in email instructions (silent — no log needed)
           if (exampleNetworkIds.has(networkId)) {
-            Logger.log("Skipping example network ID: " + networkId);
             continue;
           }
           
@@ -1095,7 +1786,7 @@ function backfillSourceEmailLinks() {
   }
 }
 
-function importDCMReports() {
+function importDCMReports(skipViolationsClear) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   
   // Process network removal requests FIRST (before importing data)
@@ -1124,7 +1815,9 @@ function importDCMReports() {
   ];
 
   dataSheet.clearContents().getRange(1,1,1,dataHeaders.length).setValues([dataHeaders]);
-  outputSheet.clearContents().getRange(1,1,1,outputHeaders.length).setValues([outputHeaders]);
+  if (!skipViolationsClear) {
+    outputSheet.clearContents().getRange(1,1,1,outputHeaders.length).setValues([outputHeaders]);
+  }
 
   const threads = GmailApp.search('label:' + label + ' after:' + formattedToday);
   let extractedData = [];
@@ -1172,6 +1865,238 @@ function importDCMReports() {
   autoAddNewNetworks_();
 }
 
+function buildFilteredRawDataAndPivot(options) {
+  options = options || {};
+  const showUiAlert = !options.suppressUiAlert;
+  const ss = withBackoff_(function(){ return SpreadsheetApp.getActiveSpreadsheet(); }, "get active spreadsheet");
+  const rawSheet = withBackoff_(function(){ return ss.getSheetByName("Raw Data"); }, "get Raw Data sheet");
+  if (!rawSheet || rawSheet.getLastRow() < 2) {
+    if (showUiAlert) {
+      SpreadsheetApp.getUi().alert("Raw Data sheet is empty. Pull data first.");
+    } else {
+      Logger.log("buildFilteredRawDataAndPivot skipped: Raw Data sheet is empty.");
+    }
+    return { filteredRowCount: 0, pivotRows: [], unassignedRows: [] };
+  }
+
+  const required = [
+    "Network ID", "Advertiser", "Placement ID", "Placement", "Campaign",
+    "Placement Start Date", "Placement End Date", "Report Date"
+  ];
+
+  const headers = withBackoff_(function(){
+    return rawSheet.getRange(1, 1, 1, rawSheet.getLastColumn()).getValues()[0];
+  }, "read Raw Data headers");
+  const m = getHeaderMap(headers);
+
+  const missing = required.filter(function(h){ return m[h] === undefined; });
+  if (missing.length) {
+    const message = "Raw Data is missing required column(s): " + missing.join(", ");
+    if (showUiAlert) {
+      SpreadsheetApp.getUi().alert(message);
+    } else {
+      Logger.log(message);
+    }
+    return { filteredRowCount: 0, pivotRows: [], unassignedRows: [] };
+  }
+
+  const ignoreSet = loadIgnoreAdvertisers(true);
+  const ownerMap = loadOwnerMapFromNetworks_();
+  const networkNameMap = loadNetworkNameMapFromNetworks_();
+  const now = options.overrideDate || new Date();
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+  const nextMonthStart = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+
+  // Build summary incrementally by chunk-reading Raw Data
+  const pairToPlacementIds = {};
+  const unassignedPlacementIds = {};
+  const dedupe = {};
+  let filteredRowCount = 0;
+  
+  const lastRow = withBackoff_(function(){ return rawSheet.getLastRow(); }, "get Raw Data lastRow");
+  const chunkSize = 5000;
+
+  for (let startRow = 2; startRow <= lastRow; startRow += chunkSize) {
+    const endRow = Math.min(startRow + chunkSize - 1, lastRow);
+    const chunkData = withBackoff_(function(){
+      return rawSheet.getRange(startRow, 1, endRow - startRow + 1, headers.length).getValues();
+    }, "read Raw Data chunk rows " + startRow + "-" + endRow);
+
+    for (let i = 0; i < chunkData.length; i++) {
+      const row = chunkData[i];
+      const netId = String(row[m["Network ID"]] || "").trim();
+      const adv = String(row[m["Advertiser"]] || "").trim();
+      const pid = String(row[m["Placement ID"]] || "").trim();
+      const campaign = String(row[m["Campaign"]] || "").trim();
+      const ps = new Date(row[m["Placement Start Date"]]);
+      const pe = new Date(row[m["Placement End Date"]]);
+      const rd = new Date(row[m["Report Date"]]);
+
+      if (!netId || !adv || !pid) continue;
+
+      const advLower = adv.toLowerCase();
+      if (advLower === "advertiser") continue; // repeated CSV header rows
+      if (advLower.indexOf("grand total") !== -1) continue;
+      if (ignoreSet.has(advLower) || advLower.indexOf("bidmanager") !== -1) continue;
+      if (campaign.indexOf("DART Search") !== -1) continue;
+
+      if (isNaN(rd) || rd < monthStart || rd >= nextMonthStart) continue;
+
+      const rep = resolveRep_(ownerMap, netId, adv) || "Unassigned";
+      const networkName = String(networkNameMap[netId] || "Unknown").trim() || "Unknown";
+      const pairKey = rep + "|||" + adv;
+      if (!pairToPlacementIds[pairKey]) pairToPlacementIds[pairKey] = {};
+      pairToPlacementIds[pairKey][pid] = true;
+
+      if (rep === "Unassigned") {
+        const unassignedKey = netId + "|||" + networkName + "|||" + adv;
+        if (!unassignedPlacementIds[unassignedKey]) unassignedPlacementIds[unassignedKey] = {};
+        unassignedPlacementIds[unassignedKey][pid] = true;
+      }
+
+      const dedupeKey = netId + "|||" + pid;
+      const candidate = [
+        netId,
+        networkName,
+        adv,
+        pid,
+        String(row[m["Placement"]] || "").trim(),
+        campaign,
+        ps,
+        pe,
+        rd,
+        rep,
+        "TRUE"
+      ];
+      const existing = dedupe[dedupeKey];
+      if (!existing || rd > existing.reportDate) {
+        dedupe[dedupeKey] = { reportDate: rd, row: candidate };
+      }
+      filteredRowCount++;
+    }
+    Logger.log("    📊 Processed chunk " + startRow + "-" + endRow + ", accumulated " + filteredRowCount + " live placements");
+  }
+
+  Logger.log("✅ Filtered data: " + filteredRowCount + " live placements across " + Object.keys(pairToPlacementIds).length + " rep/advertiser pairs");
+
+  const filteredHeaders = [
+    "Network ID", "Network Name", "Advertiser", "Placement ID", "Placement", "Campaign",
+    "Placement Start Date", "Placement End Date", "Report Date", "Owner (Ops)", "Is Live This Month"
+  ];
+  const filteredRows = Object.keys(dedupe)
+    .map(function(k){ return dedupe[k].row; })
+    .sort(function(a, b){
+      return String(a[9]).localeCompare(String(b[9]))
+        || String(a[2]).localeCompare(String(b[2]))
+        || String(a[3]).localeCompare(String(b[3]));
+    });
+
+  let filteredSheet = withBackoff_(function(){ return ss.getSheetByName("Raw Data Filtered"); }, "get Raw Data Filtered sheet");
+  if (!filteredSheet) {
+    filteredSheet = withBackoff_(function(){ return ss.insertSheet("Raw Data Filtered"); }, "insert Raw Data Filtered sheet");
+  }
+  withBackoff_(function(){ filteredSheet.clearContents(); }, "clear Raw Data Filtered contents");
+  withBackoff_(function(){
+    filteredSheet.getRange(1, 1, 1, filteredHeaders.length).setValues([filteredHeaders]);
+  }, "write Raw Data Filtered headers");
+  if (filteredRows.length) {
+    writeRowsInChunks_(filteredSheet, 2, 1, filteredRows, filteredHeaders.length, 3000, "write Raw Data Filtered");
+    withBackoff_(function(){
+      filteredSheet.getRange(2, 7, filteredRows.length, 3).setNumberFormat("yyyy-mm-dd");
+    }, "format Raw Data Filtered date columns");
+  }
+
+  let pivotSheet = withBackoff_(function(){ return ss.getSheetByName("Live Placements Pivot"); }, "get Live Placements Pivot sheet");
+  if (!pivotSheet) {
+    pivotSheet = withBackoff_(function(){ return ss.insertSheet("Live Placements Pivot"); }, "insert Live Placements Pivot sheet");
+  }
+  withBackoff_(function(){ pivotSheet.clearContents(); }, "clear Live Placements Pivot contents");
+
+  const pivotRows = Object.keys(pairToPlacementIds).map(function(key){
+      const parts = key.split("|||");
+      const owner = parts[0] || "Unassigned";
+      const advertiser = parts[1] || "";
+      const count = Object.keys(pairToPlacementIds[key]).length;
+      return [owner, advertiser, count];
+    }).sort(function(a, b){
+      return String(a[0]).localeCompare(String(b[0])) || String(a[1]).localeCompare(String(b[1]));
+    });
+
+  const unassignedHeaders = ["Network ID", "Friendly Network Name", "Advertiser Name", "Advertiser ID", "Unassigned Placement Count"];
+  const unassignedRows = Object.keys(unassignedPlacementIds).map(function(key){
+      const parts = key.split("|||");
+      const netId = parts[0] || "";
+      const networkName = parts[1] || "Unknown";
+      const advertiserName = parts[2] || "";
+      const advertiserId = "N/A";
+      const count = Object.keys(unassignedPlacementIds[key]).length;
+      return [netId, networkName, advertiserName, advertiserId, count];
+    }).sort(function(a, b){
+      return String(a[0]).localeCompare(String(b[0])) || String(a[2]).localeCompare(String(b[2]));
+    });
+
+  if (filteredRowCount > 0) {
+    const pivotHeaders = ["Owner (Ops)", "Advertiser", "Live Placement Count"];
+
+    withBackoff_(function(){
+      pivotSheet.getRange(1, 1, 1, pivotHeaders.length).setValues([pivotHeaders]);
+    }, "write Live Placements Pivot headers");
+
+    if (pivotRows.length) {
+      writeRowsInChunks_(pivotSheet, 2, 1, pivotRows, pivotHeaders.length, 3000, "write Live Placements Pivot");
+    }
+
+    const unassignedStartRow = pivotRows.length + 4;
+    withBackoff_(function(){
+      pivotSheet.getRange(unassignedStartRow, 1).setValue("Unassigned Placement Coverage");
+      pivotSheet.getRange(unassignedStartRow, 1, 1, 4).setFontWeight("bold");
+      pivotSheet.getRange(unassignedStartRow + 1, 1, 1, unassignedHeaders.length).setValues([unassignedHeaders]);
+    }, "write unassigned coverage headers");
+
+    if (unassignedRows.length) {
+      writeRowsInChunks_(pivotSheet, unassignedStartRow + 2, 1, unassignedRows, unassignedHeaders.length, 3000, "write unassigned coverage rows");
+    } else {
+      withBackoff_(function(){
+        pivotSheet.getRange(unassignedStartRow + 2, 1).setValue("No unassigned rows found for current month.");
+      }, "write no unassigned coverage message");
+    }
+
+    withBackoff_(function(){
+      pivotSheet.getRange("A1").setNote("Pivot-style summary: live placement counts by Ops Rep and Advertiser.");
+    }, "set Live Placements Pivot note");
+  } else {
+    withBackoff_(function(){
+      pivotSheet.getRange(1, 1).setValue("No live placement rows found for the current month.");
+    }, "write no-data pivot message");
+  }
+
+  if (showUiAlert) {
+    SpreadsheetApp.getUi().alert(
+      "Live placements pivot refreshed.\nLive placements found: " + filteredRowCount +
+      "\nUnassigned advertiser rows: " + Object.keys(unassignedPlacementIds).length +
+      "\nPivot tab: Live Placements Pivot"
+    );
+  }
+
+  return {
+    filteredRowCount: filteredRowCount,
+    pivotRows: pivotRows,
+    unassignedRows: unassignedRows
+  };
+}
+
+function writeRowsInChunks_(sheet, startRow, startCol, rows, width, chunkSize, label) {
+  if (!rows || !rows.length) return;
+  const size = chunkSize || 3000;
+  const tag = label || "chunk write";
+  for (let i = 0; i < rows.length; i += size) {
+    const chunk = rows.slice(i, i + size);
+    withBackoff_(function(){
+      sheet.getRange(startRow + i, startCol, chunk.length, width).setValues(chunk);
+    }, tag + " (rows " + (i + 1) + "-" + (i + chunk.length) + ")");
+  }
+}
+
 // ====== Auto-add new networks to Networks tab ======
 function autoAddNewNetworks_() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -1194,7 +2119,7 @@ function autoAddNewNetworks_() {
   }
   
   const rawNetworkIds = rawDataSheet.getRange(2, 1, rawDataLastRow - 1, 1).getValues()
-    .map(function(row){ return String(row[0] || "").trim(); })
+    .map(function(row){ return normalizeNetworkId_(row[0]); })
     .filter(function(id){ return id && id !== "Unknown" && !removedNetworks.has(id); });
   
   // Get unique Network IDs
@@ -1214,7 +2139,7 @@ function autoAddNewNetworks_() {
   if (networksLastRow >= 2) {
     const existingData = networksSheet.getRange(2, 1, networksLastRow - 1, 1).getValues();
     existingData.forEach(function(row){
-      const id = String(row[0] || "").trim();
+      const id = normalizeNetworkId_(row[0]);
       if (id) existingNetIds[id] = true;
     });
   }
@@ -1250,6 +2175,7 @@ const QA_STATE_KEY = 'qa_progress_v2';      // DocumentProperties key
 const EMAIL_TIME_BUDGET_MS = 4.5 * 60 * 1000;
 const EMAIL_STATE_KEY = 'email_progress_v1';
 const EMAIL_TRIGGER_KEY = 'email_chunk_trigger_id';
+const UNASSIGNED_ALERT_CACHE_KEY = 'unassigned_alert_cache_v1';
 const MAX_OWNERS_PER_CHUNK = 5;
 
 // ====== Error notification ======
@@ -1556,7 +2482,7 @@ function compactPerfAlertCache_(keepDays) {
 // ---------------------
 // Ignore Advertisers sheet
 // ---------------------
-function loadIgnoreAdvertisers() {
+function loadIgnoreAdvertisers(skipSheetUpdates) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName("Advertisers to ignore");
   if (!sheet) return new Set();
@@ -1569,7 +2495,7 @@ function loadIgnoreAdvertisers() {
   }
 
   const raw = ss.getSheetByName("Raw Data");
-  if (raw) {
+  if (raw && !skipSheetUpdates) {
     const data = raw.getDataRange().getValues();
     const m = getHeaderMap(data[0]);
     data.slice(1).forEach(function(r){
@@ -1583,6 +2509,97 @@ function loadIgnoreAdvertisers() {
   }
 
   return new Set(Object.keys(ignoreMap));
+}
+
+function getUnassignedAlertCache_() {
+  const raw = PropertiesService.getDocumentProperties().getProperty(UNASSIGNED_ALERT_CACHE_KEY);
+  return raw ? JSON.parse(raw) : null;
+}
+
+function saveUnassignedAlertCache_(obj) {
+  PropertiesService.getDocumentProperties().setProperty(UNASSIGNED_ALERT_CACHE_KEY, JSON.stringify(obj));
+}
+
+function sendUnassignedPlacementCoverageAlert_(options) {
+  options = options || {};
+
+  const uniqueEmails = options.overrideRecipients && options.overrideRecipients.length
+    ? normalizeRecipientEmails_(options.overrideRecipients)
+    : normalizeRecipientEmails_(UNASSIGNED_ALERT_RECIPIENTS);
+  if (uniqueEmails.length === 0) {
+    return { sent: false, reason: 'No recipients found.', rowCount: 0, recipientCount: 0 };
+  }
+
+  const unassignedRows = (options.unassignedRows || []).slice().sort(function(a, b) {
+    return String(a[0]).localeCompare(String(b[0])) || String(a[2]).localeCompare(String(b[2]));
+  });
+  if (!unassignedRows.length) {
+    return { sent: false, reason: 'No unassigned placement coverage rows found.', rowCount: 0, recipientCount: uniqueEmails.length };
+  }
+
+  const today = new Date();
+  const todayKey = Utilities.formatDate(today, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+  const signature = JSON.stringify(unassignedRows);
+  const cache = getUnassignedAlertCache_();
+
+  if (!options.forceSend && cache && cache.date === todayKey && cache.signature === signature) {
+    return {
+      sent: false,
+      reason: 'Unassigned coverage alert already sent for this snapshot today.',
+      rowCount: unassignedRows.length,
+      recipientCount: uniqueEmails.length
+    };
+  }
+
+  const htmlRows = unassignedRows.map(function(row) {
+    return ''
+      + '<tr>'
+      + '<td>' + row[0] + '</td>'
+      + '<td>' + row[1] + '</td>'
+      + '<td>' + row[2] + '</td>'
+      + '<td>' + row[3] + '</td>'
+      + '<td>' + row[4] + '</td>'
+      + '</tr>';
+  }).join('');
+
+  const htmlBody = ''
+    + '<p><b>ALERT:</b> This advertiser in this network is not mapped yet.</p>'
+    + '<table border="1" cellpadding="4" cellspacing="0" style="border-collapse:collapse;font-size:11px;">'
+    + '<tr style="background:#f2f2f2;font-weight:bold;">'
+    + '<th>Network ID</th><th>Friendly Network Name</th><th>Advertiser Name</th><th>Advertiser ID</th><th>Unassigned Placement Count</th>'
+    + '</tr>'
+    + htmlRows
+    + '</table>';
+
+  const todayStr = Utilities.formatDate(today, Session.getScriptTimeZone(), 'M/d/yy');
+  const subject = 'ALERT - Unmapped advertiser detected - ' + todayStr;
+
+  let sentCount = 0;
+  uniqueEmails.forEach(function(addr) {
+    try {
+      MailApp.sendEmail({ to: addr, subject: subject, htmlBody: htmlBody });
+      sentCount++;
+      Utilities.sleep(300);
+    } catch (err) {
+      Logger.log('❌ Failed to email ' + addr + ': ' + err);
+    }
+  });
+
+  if (sentCount > 0) {
+    saveUnassignedAlertCache_({
+      date: todayKey,
+      signature: signature,
+      rowCount: unassignedRows.length,
+      sentAt: new Date().toISOString()
+    });
+  }
+
+  return {
+    sent: sentCount > 0,
+    reason: sentCount > 0 ? '' : 'All unassigned coverage alert sends failed.',
+    rowCount: unassignedRows.length,
+    recipientCount: sentCount
+  };
 }
 
 // ---------------------
@@ -1920,20 +2937,42 @@ function normalizeAdv_(s) {
     .trim();
 }
 
+function normalizeNetworkId_(v) {
+  if (v === null || v === undefined) return "";
+  if (typeof v === "number" && isFinite(v)) return String(Math.trunc(v));
+
+  let s = String(v)
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
+    .trim();
+
+  if (!s) return "";
+  s = s.replace(/,/g, "");
+
+  // Normalize common sheet number rendering like "12345.0" to "12345"
+  if (/^\d+(?:\.0+)?$/.test(s)) {
+    return String(Math.trunc(Number(s)));
+  }
+
+  return s;
+}
+
 function resolveRep_(ownerMap, netId, adv) {
-  const rawKey  = netId + "|||" + String(adv || "").toLowerCase().trim();
-  const normKey = netId + "|||" + normalizeAdv_(adv || "");
+  const nNetId = normalizeNetworkId_(netId);
+  const rawKey  = nNetId + "|||" + String(adv || "").toLowerCase().trim();
+  const normKey = nNetId + "|||" + normalizeAdv_(adv || "");
   const rr = ownerMap.byKey[rawKey];
   const nr = ownerMap.byKey[normKey];
-  return (rr && rr.rep) || (nr && nr.rep) || "Unassigned";
+  const nb = ownerMap.byNetwork && ownerMap.byNetwork[nNetId];
+  return (rr && rr.rep) || (nr && nr.rep) || (nb && nb.rep) || "Unassigned";
 }
 
 function loadOwnerMapFromNetworks_() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sh = ss.getSheetByName("Networks");
   const byKey = {};
+  const byNetwork = {};
 
-  if (!sh || sh.getLastRow() < 2) return { byKey: byKey };
+  if (!sh || sh.getLastRow() < 2) return { byKey: byKey, byNetwork: byNetwork };
 
   const vals = sh.getDataRange().getValues();
   const hdr  = vals[0].map(function(h){ return String(h || "").trim().toLowerCase(); });
@@ -1970,23 +3009,63 @@ function loadOwnerMapFromNetworks_() {
     }
   }
 
-  if (idIdx === -1 || advIdx === -1 || repIdx === -1) return { byKey: byKey };
+  if (idIdx === -1 || repIdx === -1) return { byKey: byKey, byNetwork: byNetwork };
 
   for (let r = 1; r < vals.length; r++) {
-    const netId = String(vals[r][idIdx] || "").trim();
-    const adv   = String(vals[r][advIdx] || "").trim();
+    const netId = normalizeNetworkId_(vals[r][idIdx]);
+    const adv   = advIdx !== -1 ? String(vals[r][advIdx] || "").trim() : "";
     const theRep = String(vals[r][repIdx] || "").trim();
-    if (!netId || !adv) continue;
+    if (!netId) continue;
+
+    if (theRep && !byNetwork[netId]) {
+      byNetwork[netId] = { rep: theRep };
+    }
+
+    if (!adv) continue;
 
     const rawKey  = netId + "|||" + adv.toLowerCase();
     const normKey = netId + "|||" + normalizeAdv_(adv);
-    const payload = { rep: theRep || "Unassigned" };
+    const payload = { rep: theRep || (byNetwork[netId] && byNetwork[netId].rep) || "Unassigned" };
 
     byKey[rawKey]  = payload;
     byKey[normKey] = payload;
   }
 
-  return { byKey: byKey };
+  return { byKey: byKey, byNetwork: byNetwork };
+}
+
+function loadNetworkNameMapFromNetworks_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName("Networks");
+  const map = {};
+  if (!sh || sh.getLastRow() < 2) return map;
+
+  const vals = sh.getDataRange().getValues();
+  const hdr = vals[0].map(function(h){ return String(h || "").trim().toLowerCase(); });
+
+  function findIdx_(cands) {
+    for (let i = 0; i < cands.length; i++) {
+      const idx = hdr.indexOf(cands[i]);
+      if (idx !== -1) return idx;
+    }
+    return -1;
+  }
+
+  const idIdx = findIdx_(["network id", "network_id", "networkid", "cm360 network id"]);
+  let nameIdx = findIdx_(["network name", "network", "name", "friendly name"]);
+
+  // Backward-compatible fallback: many sheets use col B as name.
+  if (nameIdx === -1 && vals[0].length >= 2) nameIdx = 1;
+  if (idIdx === -1 || nameIdx === -1) return map;
+
+  for (let r = 1; r < vals.length; r++) {
+    const id = String(vals[r][idIdx] || "").trim();
+    const name = String(vals[r][nameIdx] || "").trim();
+    if (!id) continue;
+    map[id] = name || "Unknown";
+  }
+
+  return map;
 }
 
 // Export a single Sheet as XLSX blob (robust via export endpoint)
@@ -2378,10 +3457,16 @@ function getCurrentMonthOverage() {
 // ---------------------
 // runQAOnly (auto-resume, chunked, lock-guarded)
 // ---------------------
-function runQAOnly() {
+function runQAOnly(options) {
+  options = options || {};
+  const disableChunking = !!options.disableChunking;
+
   // Prevent overlapping runs
   const dlock = LockService.getDocumentLock();
-  if (!dlock.tryLock(5000)) { scheduleNextQAChunk_(2); return; }
+  if (!dlock.tryLock(5000)) {
+    if (!disableChunking) scheduleNextQAChunk_(2);
+    return;
+  }
 
   // Clear any stale scheduled id right as we start a chunk
   cancelQAChunkTrigger_();
@@ -2404,6 +3489,7 @@ function runQAOnly() {
     const monitoredNetworks = getMonitoredNetworkIds_();
     
     Logger.log("📋 Monitored networks: " + (monitoredNetworks.length > 0 ? monitoredNetworks.join(", ") : "NONE - will process ALL networks"));
+    Logger.log("⚙️ runQAOnly mode: " + (disableChunking ? "manual immediate (no chunk limits)" : "chunked auto-resume"));
 
     compileLPPatternsIfNeeded_();
 
@@ -2413,13 +3499,22 @@ function runQAOnly() {
 
     if (freshStart) {
       clearViolations();
-      state = { session: String(Date.now()), next: 2, totalRows: totalRows };
+      state = {
+        session: String(Date.now()),
+        next: 2,
+        totalRows: totalRows,
+        overrideDateIso: options.overrideDate ? new Date(options.overrideDate).toISOString() : ''
+      };
       saveQAState_(state);
       cancelQAChunkTrigger_();
+    } else if (options.overrideDate && !state.overrideDateIso) {
+      state.overrideDateIso = new Date(options.overrideDate).toISOString();
+      saveQAState_(state);
     }
 
     const startTime = Date.now();
-    const today = new Date();
+    const persistedOverrideDate = state.overrideDateIso ? new Date(state.overrideDateIso) : null;
+    const today = options.overrideDate || persistedOverrideDate || new Date();
     const firstOfMonth = new Date(today.getFullYear(), today.getMonth(), 1);
 
     // —— Tweak these constants in your file (outside this function) ——
@@ -2433,7 +3528,7 @@ function runQAOnly() {
       const row = data[r];
       const adv  = row[m["Advertiser"]] && String(row[m["Advertiser"]]).trim();
       const camp = row[m["Campaign"]]   || "";
-      const netId = String(row[m["Network ID"]] || "").trim();
+      const netId = normalizeNetworkId_(row[m["Network ID"]]);
 
       // Filter by monitored networks (if any are specified)
       if (monitoredNetworks.length > 0 && netId && monitoredNetworks.indexOf(netId) === -1) { 
@@ -2543,7 +3638,7 @@ function runQAOnly() {
       if (!issueTypes.length) { state.next = r + 1; continue; }
 
       const pid = String(row[m["Placement ID"]] || "");
-      const key = pid ? ("pid:" + pid) : ("k:" + row[m["Network ID"]] + "|" + camp + "|" + row[m["Placement"]]);
+      const key = pid ? ("pid:" + pid) : ("k:" + netId + "|" + camp + "|" + row[m["Placement"]]);
       const changes = upsertViolationChange_(vMap, key, rd, imp, clk, pe);
 
       function daysSince_(lastChangeDate, reportDate) {
@@ -2569,9 +3664,11 @@ function runQAOnly() {
       processed++;
       state.next = r + 1;
 
-      // Respect chunk size & time budget
-      if (processed >= QA_CHUNK_ROWS) break;
-      if ((Date.now() - startTime) >= QA_TIME_BUDGET_MS) break;
+      // Respect chunk size & time budget only in chunked mode.
+      if (!disableChunking) {
+        if (processed >= QA_CHUNK_ROWS) break;
+        if ((Date.now() - startTime) >= QA_TIME_BUDGET_MS) break;
+      }
     }
 
     // Persist violation-change snapshot
@@ -2594,11 +3691,22 @@ function runQAOnly() {
       clearQAState_();
       cancelQAChunkTrigger_();
       Logger.log("✅ runQAOnly complete. Processed all " + totalRows + " data rows.");
+
+      // If a historical backfill is paused at QA stage, nudge it to continue to email.
+      const histState = getHistoricalBackfillState_();
+      if (histState && histState.stage === 'qa') {
+        Logger.log("⏭️ runQAOnly complete: nudging Historical Backfill to continue.");
+        scheduleHistoricalBackfillNextChunk_(1);
+      }
     } else {
       saveQAState_(state);
       Logger.log("⏳ runQAOnly partial: processed " + processed + " rows this run. Next row index: "
         + state.next + " / " + (data.length - 1));
-      scheduleNextQAChunk_(2); // resume soon
+      if (!disableChunking) {
+        scheduleNextQAChunk_(2); // resume soon
+      } else {
+        Logger.log("⚠️ Immediate mode exited before completion. Re-run Run QA Only (Immediate) to continue.");
+      }
     }
   } finally {
     dlock.releaseLock();
@@ -2859,8 +3967,8 @@ function sendEmailSummaryChunked_(allowChunking, skipDateCheck, overrideRecipien
       // Assemble email
       const subject = "CM360 CPC/CPM FLIGHT QA – " + Utilities.formatDate(today, Session.getScriptTimeZone(), "M/d/yy");
       let htmlBody = state.cachedHtml.networkSummary +
-                     '<p>The below is a table of the following Billing, Delivery, Performance and Cost issues:</p>' +
-                     state.cachedHtml.groupedSummary +
+                     '<p style="font-size:11px;">The below is a table of the following Billing, Delivery, Performance and Cost issues:</p>' +
+                     '<div style="font-size:11px;">' + state.cachedHtml.groupedSummary + '</div>' +
                      (state.cachedHtml.immediateAttention ? ('<br/>' + state.cachedHtml.immediateAttention) : '') +
                      (state.cachedHtml.midFlightHtml ? ('<br/>' + state.cachedHtml.midFlightHtml) : '') +
                      '<br/>' + state.cachedHtml.staleHtml +
@@ -2938,6 +4046,11 @@ function buildNetworkSummaryHtml_(violations, rawData, networksSheet) {
   const hMap = getHeaderMap(violations[0]);
   const rMap = getHeaderMap(rawData[0]);
 
+  function isPlaceholderNetworkName_(name) {
+    const n = String(name || "").trim().toLowerCase();
+    return !n || n === "to be added" || n === "unknown";
+  }
+
   function buildNetworkNameMap_() {
     if (!networksSheet) return {};
     const vals = networksSheet.getDataRange().getValues();
@@ -2946,47 +4059,54 @@ function buildNetworkSummaryHtml_(violations, rawData, networksSheet) {
       const idRaw = vals[r][0];
       const name  = String(vals[r][1] == null ? "" : vals[r][1]).replace(/\u00A0/g, " ").trim();
       if (!idRaw) continue;
-      let id = "";
-      if (typeof idRaw === "number") id = String(Math.trunc(idRaw));
-      else {
-        let s = String(idRaw).replace(/[\u200B-\u200D\uFEFF]/g, "").trim();
-        s = s.replace(/,/g, "");
-        const digits = s.replace(/\D+/g, "");
-        id = digits || s;
+      const id = normalizeNetworkId_(idRaw);
+      if (!id) continue;
+
+      // Prefer real names over placeholders when duplicate Network IDs exist.
+      if (!map[id]) {
+        map[id] = name;
+      } else if (isPlaceholderNetworkName_(map[id]) && !isPlaceholderNetworkName_(name)) {
+        map[id] = name;
       }
-      if (id) map[id] = name;
     }
     return map;
   }
   const networkNameMap = buildNetworkNameMap_();
   
-  // Get all monitored networks
-  const monitoredSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Monitored Networks");
-  const allMonitoredNetworks = [];
-  if (monitoredSheet) {
-    const monitoredData = monitoredSheet.getDataRange().getValues();
-    for (let i = 1; i < monitoredData.length; i++) {
-      const id = String(monitoredData[i][0] || "").trim();
-      const name = String(monitoredData[i][1] || "").trim();
+  // Get all networks from the networks sheet (not Monitored Networks)
+  // This ensures the summary always includes all networks in your networks tab
+  const allNetworks = [];
+  if (networksSheet) {
+    const networkData = networksSheet.getDataRange().getValues();
+    for (let i = 1; i < networkData.length; i++) {
+      const id = normalizeNetworkId_(networkData[i][0]);
+      const name = String(networkData[i][1] || "").trim();
       if (id) {
-        allMonitoredNetworks.push({ id: id, name: name || "TO BE ADDED" });
-        // Ensure it's in the name map
-        if (!networkNameMap[id]) {
-          networkNameMap[id] = name || "TO BE ADDED";
-        }
+        allNetworks.push({ id: id, name: name || "TO BE ADDED" });
       }
     }
   }
 
   const placementCounts = {};
+  const reportPresence = {};
   rawData.slice(1).forEach(function(r){
-    const id = String(r[rMap["Network ID"]] || "");
-    if (id) placementCounts[id] = (placementCounts[id] || 0) + 1;
+    const id = normalizeNetworkId_(r[rMap["Network ID"]]);
+    if (!id) return;
+
+    reportPresence[id] = true;
+
+    const advertiser = String(r[rMap["Advertiser"]] || "").trim();
+    const placementId = String(r[rMap["Placement ID"]] || "").trim();
+
+    if (!placementId) return;
+    if (advertiser === "Grand Total:") return;
+
+    placementCounts[id] = (placementCounts[id] || 0) + 1;
   });
 
   const violationCounts = {};
   violations.slice(1).forEach(function(r){
-    const id = String(r[hMap["Network ID"]] || "");
+    const id = normalizeNetworkId_(r[hMap["Network ID"]]);
     const types = String(r[hMap["Issue Type"]] || "").split(", ");
     if (!violationCounts[id]) {
       violationCounts[id] = { "🟥 BILLING": 0, "🟦 DELIVERY": 0, "🟨 PERFORMANCE": 0, "🟩 COST": 0 };
@@ -3006,30 +4126,58 @@ function buildNetworkSummaryHtml_(violations, rawData, networksSheet) {
     + '<th>🟥 BILLING</th><th>🟦 DELIVERY</th><th>🟨 PERFORMANCE</th><th>🟩 COST</th>'
     + '</tr>';
 
-  // Show all monitored networks (even with 0 placements)
-  const monitoredIds = allMonitoredNetworks.map(function(n){ return n.id; });
+  // Show all networks from the networks sheet
+  const allNetworkIds = allNetworks.map(function(n){ return n.id; });
   
-  Object.entries(networkNameMap)
-    .filter(function(pair){
-      const id = pair[0];
-      // Show if monitored (even with 0) OR has violations
-      const isMonitored = monitoredIds.indexOf(id) !== -1;
-      const vc = violationCounts[id] || { "🟥 BILLING":0,"🟦 DELIVERY":0,"🟨 PERFORMANCE":0,"🟩 COST":0 };
-      const total = vc["🟥 BILLING"] + vc["🟦 DELIVERY"] + vc["🟨 PERFORMANCE"] + vc["🟩 COST"];
-      return isMonitored || total > 0;
-    })
-    .sort(function(a, b){ return a[1].localeCompare(b[1]); })
-    .forEach(function(entry){
-      const id = entry[0], name = entry[1];
+  allNetworks
+    .sort(function(a, b){ return a.name.localeCompare(b.name); })
+    .forEach(function(network){
+      const id = network.id, name = network.name;
       const pc = placementCounts[id] || 0;
+      const placementDisplay = pc > 0
+        ? String(pc)
+        : (reportPresence[id] ? "0 - report present" : "0 - no report present today");
       const vc = violationCounts[id] || { "🟥 BILLING":0,"🟦 DELIVERY":0,"🟨 PERFORMANCE":0,"🟩 COST":0 };
       html += '<tr>'
-        + '<td>' + id + '</td><td>' + name + '</td><td>' + pc + '</td>'
+        + '<td>' + id + '</td><td>' + name + '</td><td>' + placementDisplay + '</td>'
         + '<td>' + vc["🟥 BILLING"] + '</td><td>' + vc["🟦 DELIVERY"] + '</td><td>' + vc["🟨 PERFORMANCE"] + '</td><td>' + vc["🟩 COST"] + '</td>'
         + '</tr>';
     });
-  html += '</table><br/>';
-  
+  html += '</table>';
+
+  // --- Violation type legend ---
+  html += '<br/>'
+    + '<p><b>What the Violations tab tracks</b></p>'
+    + '<table border="0" cellpadding="3" cellspacing="0" style="font-size: 11px; border-collapse: collapse;">'
+
+    + '<tr><td colspan="2" style="padding-top:6px; font-weight:bold;">🟥 BILLING</td></tr>'
+    + '<tr><td style="padding-left:16px; color:#555;">Expired CPC Risk</td>'
+    + '<td style="padding-left:8px;">Ended before this month and clicks &gt; impressions.</td></tr>'
+    + '<tr><td style="padding-left:16px; color:#555;">Recently Expired CPC Risk</td>'
+    + '<td style="padding-left:8px;">Ended earlier this month and still clicks &gt; impressions.</td></tr>'
+    + '<tr><td style="padding-left:16px; color:#555;">Active CPC Billing Risk</td>'
+    + '<td style="padding-left:8px;">Active (report date &le; end date), clicks &gt; impressions, and $CPC &gt; $10.</td></tr>'
+
+    + '<tr><td colspan="2" style="padding-top:6px; font-weight:bold;">🟦 DELIVERY</td></tr>'
+    + '<tr><td style="padding-left:16px; color:#555;">Post-Flight Activity</td>'
+    + '<td style="padding-left:8px;">Ended before this month but shows impressions or clicks this month.</td></tr>'
+
+    + '<tr><td colspan="2" style="padding-top:6px; font-weight:bold;">🟨 PERFORMANCE</td></tr>'
+    + '<tr><td style="padding-left:16px; color:#555;">CTR &ge; 90% &amp; CPM &ge; $10</td>'
+    + '<td style="padding-left:8px;">Extreme CTR with meaningful CPM spend.</td></tr>'
+
+    + '<tr><td colspan="2" style="padding-top:6px; font-weight:bold;">🟩 COST</td></tr>'
+    + '<tr><td style="padding-left:16px; color:#555;">CPC Only &gt; $10</td>'
+    + '<td style="padding-left:8px;">No CPM spend and $CPC &gt; $10.</td></tr>'
+    + '<tr><td style="padding-left:16px; color:#555;">CPM Only &gt; $10</td>'
+    + '<td style="padding-left:8px;">No CPC spend and $CPM &gt; $10.</td></tr>'
+    + '<tr><td style="padding-left:16px; color:#555;">CPC+CPM Clicks &gt; Impr &amp; CPC &gt; $10</td>'
+    + '<td style="padding-left:8px;">Both CPC &amp; CPM active, clicks &gt; impressions, and $CPC &gt; $10.</td></tr>'
+    + '<tr><td style="padding-left:16px; color:#555;">(Low Priority)</td>'
+    + '<td style="padding-left:8px;">Kept for audit trail; de-prioritized in email sorting.</td></tr>'
+
+    + '</table><br/>';
+
   return html;
 }
 
@@ -3346,6 +4494,7 @@ function logStep_(label, fn, runStartMs, quotaMinutes) {
 function runItAll() {
   var APPROX_QUOTA_MINUTES = 6; // leave at 6 unless your domain truly has more
   var runStart = Date.now();
+  var pivotResult;
   Logger.log('🚀 runItAll — START @ ' + new Date(runStart).toISOString()
              + ' (approx quota: ' + APPROX_QUOTA_MINUTES + ' min)');
 
@@ -3353,6 +4502,14 @@ function runItAll() {
     // 1) Prep & ingest
     logStep_('trimAllSheetsToData_', function(){ trimAllSheetsToData_(); }, runStart, APPROX_QUOTA_MINUTES);
     logStep_('importDCMReports',     function(){ importDCMReports();      }, runStart, APPROX_QUOTA_MINUTES);
+    pivotResult = logStep_('buildFilteredRawDataAndPivot', function(){
+      return buildFilteredRawDataAndPivot({ suppressUiAlert: true });
+    }, runStart, APPROX_QUOTA_MINUTES);
+    logStep_('sendUnassignedPlacementCoverageAlert_', function(){
+      return sendUnassignedPlacementCoverageAlert_({
+        unassignedRows: pivotResult ? pivotResult.unassignedRows : []
+      });
+    }, runStart, APPROX_QUOTA_MINUTES);
 
     // 2) If low on time, schedule QA and exit (handoff)
     var totalMs  = Date.now() - runStart;
@@ -3386,6 +4543,7 @@ function runItAll() {
 function runItAllMorning() {
   var APPROX_QUOTA_MINUTES = 6;
   var runStart = Date.now();
+  var pivotResult;
   const isAuto = !isManualRun_();
   
   Logger.log('🚀 runItAllMorning — START @ ' + new Date(runStart).toISOString()
@@ -3395,6 +4553,14 @@ function runItAllMorning() {
     // 1) Prep & ingest
     logStep_('trimAllSheetsToData_', function(){ trimAllSheetsToData_(); }, runStart, APPROX_QUOTA_MINUTES);
     logStep_('importDCMReports',     function(){ importDCMReports();      }, runStart, APPROX_QUOTA_MINUTES);
+    pivotResult = logStep_('buildFilteredRawDataAndPivot', function(){
+      return buildFilteredRawDataAndPivot({ suppressUiAlert: true });
+    }, runStart, APPROX_QUOTA_MINUTES);
+    logStep_('sendUnassignedPlacementCoverageAlert_', function(){
+      return sendUnassignedPlacementCoverageAlert_({
+        unassignedRows: pivotResult ? pivotResult.unassignedRows : []
+      });
+    }, runStart, APPROX_QUOTA_MINUTES);
 
     // 2) If low on time, schedule QA and exit (handoff)
     var totalMs  = Date.now() - runStart;
@@ -3858,16 +5024,10 @@ function runQAOnlyImmediate() {
   }
 
   // Don't clear violations here - runQAOnly() will do it when it detects freshStart
-  
-  Logger.log('Processing ' + (data.length - 1) + ' rows immediately...');
-  
-  // Set up a fake state that processes all rows
-  const state = { session: String(Date.now()), next: 2, totalRows: data.length - 1 };
-  saveQAState_(state);
-  
-  // Call the regular runQAOnly but it will try to process everything in one go
-  // This will timeout if too large, but user will see exactly where
-  runQAOnly();
+  Logger.log('Processing ' + (data.length - 1) + ' rows immediately (no chunk limits)...');
+
+  // Call the regular QA engine in immediate mode (disables chunk caps/scheduling).
+  runQAOnly({ disableChunking: true });
   
   const duration = Date.now() - startTime;
   Logger.log('✅ runQAOnlyImmediate completed in ' + fmtMs_(duration));

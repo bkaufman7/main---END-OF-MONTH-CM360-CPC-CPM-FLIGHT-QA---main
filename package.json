@@ -1,0 +1,24 @@
+{
+  "name": "main-eom-dcm-project",
+  "version": "1.0.0",
+  "description": "**What it does:** Automatically imports CM360 placement reports from Gmail, analyzes 29,000+ rows for billing/delivery/performance/cost issues, generates violations with 25+ detection rules, and emails detailed QA reports with XLSX attachments to operations teams.",
+  "main": "campaign extractor.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bkaufman7/main---END-OF-MONTH-CM360-CPC-CPM-FLIGHT-QA---main.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/bkaufman7/main---END-OF-MONTH-CM360-CPC-CPM-FLIGHT-QA---main/issues"
+  },
+  "homepage": "https://github.com/bkaufman7/main---END-OF-MONTH-CM360-CPC-CPM-FLIGHT-QA---main#readme",
+  "dependencies": {
+    "exceljs": "^4.4.0"
+  }
+}
